@@ -1,0 +1,447 @@
+from __future__ import annotations
+
+import logging
+import json
+from datetime import datetime, timezone
+from typing import Any, List, Optional
+
+import aiosqlite
+
+from backend.config import DB_PATH
+
+logger = logging.getLogger("db.models")
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+async def init_db(db_path: str = DB_PATH) -> None:
+    """初始化数据库表"""
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("PRAGMA journal_mode=WAL")
+        await db.execute("PRAGMA foreign_keys=ON")
+        await db.executescript("""
+            CREATE TABLE IF NOT EXISTS sessions (
+                id TEXT PRIMARY KEY,
+                type TEXT NOT NULL CHECK(type IN ('dev', 'debug')),
+                status TEXT NOT NULL DEFAULT 'running'
+                    CHECK(status IN ('running', 'paused', 'done', 'failed')),
+                project_path TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                role TEXT NOT NULL CHECK(role IN ('system', 'user', 'assistant', 'tool')),
+                content TEXT DEFAULT '',
+                tool_calls TEXT DEFAULT NULL,
+                token_count INTEGER DEFAULT 0,
+                node TEXT DEFAULT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS artifacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                type TEXT NOT NULL CHECK(type IN (
+                    'clarification', 'requirement', 'code_changes',
+                    'review', 'diagnosis', 'output_summary', 'plan'
+                )),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS long_term_memory (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL CHECK(category IN ('task', 'error', 'preference')),
+                title TEXT NOT NULL,
+                content TEXT NOT NULL,
+                embedding BLOB DEFAULT NULL,
+                source_session_id TEXT REFERENCES sessions(id),
+                relevance_score REAL DEFAULT 0.0,
+                created_at TEXT NOT NULL,
+                last_recalled_at TEXT DEFAULT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS rag_embeddings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_type TEXT NOT NULL CHECK(source_type IN ('file', 'memory', 'error', 'spec')),
+                source_path TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL DEFAULT 0,
+                content TEXT NOT NULL,
+                embedding BLOB DEFAULT NULL,
+                token_count INTEGER DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS workflow_traces (
+                trace_id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id),
+                workflow_type TEXT NOT NULL,
+                project_path TEXT NOT NULL DEFAULT '',
+                description TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'running',
+                started_at TEXT NOT NULL,
+                finished_at TEXT DEFAULT NULL,
+                duration_ms INTEGER DEFAULT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                error_message TEXT DEFAULT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trace_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL REFERENCES workflow_traces(trace_id),
+                event_type TEXT NOT NULL,
+                stage TEXT DEFAULT NULL,
+                payload TEXT NOT NULL DEFAULT '{}',
+                duration_ms INTEGER DEFAULT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trace_labels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL REFERENCES workflow_traces(trace_id),
+                outcome TEXT NOT NULL,
+                requirement_fit TEXT DEFAULT NULL,
+                code_quality TEXT DEFAULT NULL,
+                review_effectiveness TEXT DEFAULT NULL,
+                diagnosis_effectiveness TEXT DEFAULT NULL,
+                adoption TEXT DEFAULT NULL,
+                fix_effectiveness TEXT DEFAULT NULL,
+                issue_types TEXT NOT NULL DEFAULT '[]',
+                note TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS evaluation_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                project_path TEXT DEFAULT NULL,
+                workflow_type TEXT DEFAULT NULL,
+                start_at TEXT DEFAULT NULL,
+                end_at TEXT DEFAULT NULL,
+                metrics TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS trace_evaluations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                trace_id TEXT NOT NULL REFERENCES workflow_traces(trace_id),
+                metric_name TEXT NOT NULL,
+                score REAL DEFAULT NULL,
+                source TEXT NOT NULL CHECK(source IN ('rule', 'human')),
+                evidence_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
+            CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
+            CREATE INDEX IF NOT EXISTS idx_rag_source ON rag_embeddings(source_path);
+            CREATE INDEX IF NOT EXISTS idx_rag_type ON rag_embeddings(source_type);
+            CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memory(category);
+            CREATE INDEX IF NOT EXISTS idx_trace_session ON workflow_traces(session_id, started_at);
+            CREATE INDEX IF NOT EXISTS idx_trace_status ON workflow_traces(status, started_at);
+            CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_trace_labels_trace ON trace_labels(trace_id, id);
+            CREATE INDEX IF NOT EXISTS idx_trace_evaluations_trace ON trace_evaluations(trace_id, metric_name);
+        """)
+        await _migrate_schema(db)
+        await db.commit()
+    logger.info("数据库初始化完成")
+
+
+async def _migrate_schema(db: aiosqlite.Connection) -> None:
+    """为已有 SQLite 数据库补充偏好记忆字段，重复执行安全。"""
+    cursor = await db.execute("PRAGMA table_info(long_term_memory)")
+    columns = {row[1] for row in await cursor.fetchall()}
+    migrations = {
+        "scope_type": "TEXT NOT NULL DEFAULT 'global'",
+        "scope_value": "TEXT NOT NULL DEFAULT ''",
+        "source_type": "TEXT NOT NULL DEFAULT 'workflow'",
+        "source_trace_id": "TEXT DEFAULT NULL",
+        "confidence": "REAL NOT NULL DEFAULT 0.5",
+        "occurrence_count": "INTEGER NOT NULL DEFAULT 1",
+        "status": "TEXT NOT NULL DEFAULT 'active'",
+        "supersedes_memory_id": "INTEGER DEFAULT NULL",
+        "last_verified_at": "TEXT DEFAULT NULL",
+    }
+    for name, definition in migrations.items():
+        if name not in columns:
+            await db.execute(f"ALTER TABLE long_term_memory ADD COLUMN {name} {definition}")
+
+
+class Database:
+    """异步数据库操作类"""
+
+    def __init__(self, db_path: str = DB_PATH) -> None:
+        self.db_path = db_path
+
+    async def __aenter__(self) -> "Database":
+        self._conn = await aiosqlite.connect(self.db_path)
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA foreign_keys=ON")
+        return self
+
+    async def __aexit__(self, *args: Any) -> None:
+        await self._conn.close()
+
+    # ---- Session 操作 ----
+
+    async def create_session(self, session_id: str, workflow_type: str,
+                             project_path: str = "", description: str = "") -> None:
+        await self._conn.execute(
+            "INSERT INTO sessions (id, type, status, project_path, description, created_at) "
+            "VALUES (?, ?, 'running', ?, ?, ?)",
+            (session_id, workflow_type, project_path, description, _now()),
+        )
+        await self._conn.commit()
+
+    async def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM sessions WHERE id = ?", (session_id,)
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def update_session_status(self, session_id: str, status: str) -> None:
+        await self._conn.execute(
+            "UPDATE sessions SET status = ? WHERE id = ?", (status, session_id)
+        )
+        await self._conn.commit()
+
+    async def update_session_workflow_type(self, session_id: str, workflow_type: str) -> None:
+        """在意图澄清后同步会话的实际执行流程类型。"""
+        await self._conn.execute(
+            "UPDATE sessions SET type = ? WHERE id = ?", (workflow_type, session_id)
+        )
+        await self._conn.commit()
+
+    # ---- Message 操作 ----
+
+    async def add_message(self, session_id: str, role: str, content: str = "",
+                          token_count: int = 0, node: Optional[str] = None,
+                          tool_calls: Optional[str] = None) -> int:
+        cursor = await self._conn.execute(
+            "INSERT INTO messages (session_id, role, content, tool_calls, token_count, node, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (session_id, role, content, tool_calls, token_count, node, _now()),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_messages_by_session(self, session_id: str, limit: int = 50,
+                                      node: Optional[str] = None) -> list[dict[str, Any]]:
+        if node:
+            cursor = await self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? AND node = ? "
+                "ORDER BY id DESC LIMIT ?",
+                (session_id, node, limit),
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT * FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT ?",
+                (session_id, limit),
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    # ---- Artifact 操作 ----
+
+    async def add_artifact(self, session_id: str, artifact_type: str,
+                           content: str) -> int:
+        cursor = await self._conn.execute(
+            "INSERT INTO artifacts (session_id, type, content, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (session_id, artifact_type, content, _now()),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def get_artifacts_by_session(self, session_id: str) -> list[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM artifacts WHERE session_id = ? ORDER BY id ASC",
+            (session_id,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_latest_artifact(self, session_id: str,
+                                  artifact_type: str) -> Optional[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM artifacts WHERE session_id = ? AND type = ? "
+            "ORDER BY id DESC LIMIT 1",
+            (session_id, artifact_type),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    # ---- 长期记忆操作 ----
+
+    async def insert_long_term_memory(self, category: str, title: str, content: str,
+                                      embedding: Optional[bytes] = None,
+                                      source_session_id: Optional[str] = None) -> int:
+        cursor = await self._conn.execute(
+            "INSERT INTO long_term_memory (category, title, content, embedding, "
+            "source_session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+            (category, title, content, embedding, source_session_id, _now()),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def search_long_term_memory(self, keyword: str,
+                                      category: Optional[str] = None,
+                                      limit: int = 10) -> list[dict[str, Any]]:
+        if category:
+            cursor = await self._conn.execute(
+                "SELECT * FROM long_term_memory WHERE category = ? AND "
+                "(title LIKE ? OR content LIKE ?) ORDER BY created_at DESC LIMIT ?",
+                (category, f"%{keyword}%", f"%{keyword}%", limit),
+            )
+        else:
+            cursor = await self._conn.execute(
+                "SELECT * FROM long_term_memory WHERE title LIKE ? OR content LIKE ? "
+                "ORDER BY created_at DESC LIMIT ?",
+                (f"%{keyword}%", f"%{keyword}%", limit),
+            )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_long_term_memory_by_category(self, category: str,
+                                               limit: int = 20) -> list[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM long_term_memory WHERE category = ? "
+            "ORDER BY created_at DESC LIMIT ?",
+            (category, limit),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def update_memory_recall(self, memory_id: int) -> None:
+        await self._conn.execute(
+            "UPDATE long_term_memory SET last_recalled_at = ? WHERE id = ?",
+            (_now(), memory_id),
+        )
+        await self._conn.commit()
+
+    # ---- RAG Embedding 操作 ----
+
+    async def insert_rag_embedding(self, source_type: str, source_path: str,
+                                   chunk_index: int, content: str,
+                                   embedding: Optional[bytes] = None,
+                                   token_count: int = 0) -> int:
+        now = _now()
+        cursor = await self._conn.execute(
+            "INSERT INTO rag_embeddings (source_type, source_path, chunk_index, "
+            "content, embedding, token_count, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (source_type, source_path, chunk_index, content, embedding,
+             token_count, now, now),
+        )
+        await self._conn.commit()
+        return cursor.lastrowid
+
+    async def update_rag_embedding(self, embed_id: int, content: str,
+                                   embedding: bytes, token_count: int) -> None:
+        await self._conn.execute(
+            "UPDATE rag_embeddings SET content = ?, embedding = ?, "
+            "token_count = ?, updated_at = ? WHERE id = ?",
+            (content, embedding, token_count, _now(), embed_id),
+        )
+        await self._conn.commit()
+
+    async def delete_rag_by_source(self, source_path: str) -> None:
+        await self._conn.execute(
+            "DELETE FROM rag_embeddings WHERE source_path = ?", (source_path,)
+        )
+        await self._conn.commit()
+
+    async def has_source_path(self, source_path: str) -> bool:
+        cursor = await self._conn.execute(
+            "SELECT COUNT(*) FROM rag_embeddings WHERE source_path = ?",
+            (source_path,),
+        )
+        row = await cursor.fetchone()
+        return row[0] > 0 if row else False
+
+    async def get_all_rag_embeddings(self,
+                                     source_type: Optional[str] = None) -> list[dict[str, Any]]:
+        if source_type:
+            cursor = await self._conn.execute(
+                "SELECT * FROM rag_embeddings WHERE source_type = ?", (source_type,)
+            )
+        else:
+            cursor = await self._conn.execute("SELECT * FROM rag_embeddings")
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def get_rag_by_source(self, source_path: str) -> list[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM rag_embeddings WHERE source_path = ? ORDER BY chunk_index",
+            (source_path,),
+        )
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+    async def keyword_search_rag(self, keywords: str,
+                                 source_type: Optional[str] = None,
+                                 limit: int = 20) -> list[dict[str, Any]]:
+        """关键词搜索 RAG 索引"""
+        kw_list = [kw.strip() for kw in keywords.split() if kw.strip()]
+        if not kw_list:
+            parts = ["content LIKE ?"]
+            params: list[Any] = [f"%{keywords}%"]
+        else:
+            parts = ["content LIKE ?" for _ in kw_list]
+            params = [f"%{kw}%" for kw in kw_list]
+
+        condition = " OR ".join(parts)
+        if source_type:
+            condition = f"({condition}) AND source_type = ?"
+            params.append(source_type)
+
+        sql = (f"SELECT * FROM rag_embeddings WHERE {condition} "
+               f"ORDER BY updated_at DESC LIMIT ?")
+        params.append(limit)
+
+        cursor = await self._conn.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_session(db_path: str = DB_PATH) -> Database:
+    """创建 Database 实例（用于 async with 上下文管理）"""
+    return Database(db_path)
+
+
+# ---- 独立函数（供快速调用） ----
+
+async def create_session(session_id: str, workflow_type: str,
+                         project_path: str = "", description: str = "") -> None:
+    db = Database()
+    await db.__aenter__()
+    try:
+        await db.create_session(session_id, workflow_type, project_path, description)
+    finally:
+        await db.__aexit__()
+
+
+async def get_artifacts_by_session(session_id: str) -> list[dict[str, Any]]:
+    db = Database()
+    await db.__aenter__()
+    try:
+        return await db.get_artifacts_by_session(session_id)
+    finally:
+        await db.__aexit__()
+
+
+async def update_session_status(session_id: str, status: str) -> None:
+    db = Database()
+    await db.__aenter__()
+    try:
+        await db.update_session_status(session_id, status)
+    finally:
+        await db.__aexit__()
