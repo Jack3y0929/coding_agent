@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from pathlib import Path
 
 from backend.budget import TokenBudget
 from backend.graph.nodes import build_node_messages, call_deepseek
@@ -13,9 +14,22 @@ from backend.intent.models import CodingIntent
 logger = logging.getLogger("intent.service")
 
 
-INTENT_SYSTEM_PROMPT = """你是 Coding Agent 的研发意图分析器。只根据用户任务和项目路径提取结构化研发槽位，禁止编写代码、禁止调用工具、禁止输出推理过程。
-任务类型只能是 dev、debug、refactor、clarify。target_modules/change_scope 必须是相对项目根目录的路径或明确模块名；无法确认时保留空数组。验收标准必须是用户明确提出或可直接验证的要求，不能编造。
-请只输出一个 JSON 对象，字段必须完整：task_type、confidence、task_description、target_modules、change_scope、protected_paths、acceptance_criteria、tech_constraints、validation_commands、reproduction_steps、observed_behavior、expected_behavior、risk_level、missing_slots。"""
+_INTENT_PROMPT_PATH = Path(__file__).resolve().parents[1] / "agents" / "intent_prompt.md"
+
+
+def _load_intent_prompt() -> str:
+    """加载意图分析 Skill，保持提示词与运行时实现单一来源。"""
+    try:
+        return _INTENT_PROMPT_PATH.read_text(encoding="utf-8")
+    except OSError as exc:
+        logger.warning("意图分析 Skill 加载失败，使用最小安全提示词: %s", exc)
+        return (
+            "你是 Coding Agent 的研发意图分析器。只根据输入提取事实，"
+            "禁止编写代码、调用工具或输出推理过程。只输出完整 JSON。"
+        )
+
+
+INTENT_SYSTEM_PROMPT = _load_intent_prompt()
 
 
 async def extract_coding_intent(

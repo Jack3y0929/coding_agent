@@ -314,6 +314,7 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "fix_attempt": 0,
             "diagnosis_report": None,
             "diagnosis_sufficient": False,
+            "diagnosis_evidence": {},
             "new_logs": None,
             "token_used": 0,
             "status": "running",

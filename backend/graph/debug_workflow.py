@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -20,6 +21,7 @@ from backend.graph.nodes import (
     load_system_prompt,
     run_fc_loop,
 )
+from backend.graph.review import aggregate_review_reports, run_review_perspective
 from backend.rag.retriever import init_spec_library
 
 logger = logging.getLogger("graph.debug")
@@ -35,10 +37,22 @@ class DebugWorkflowState(TypedDict):
     clarification_doc: str | None
     diagnosis_report: str | None
     diagnosis_sufficient: bool
+    diagnosis_evidence: dict[str, Any]
     new_logs: str | None
     code_changes: dict[str, str] | None
     implementation_note: str | None
     review_report: str | None
+    review_logic_report: str | None
+    review_security_report: str | None
+    review_quality_report: str | None
+    review_logic_result: dict[str, Any] | None
+    review_security_result: dict[str, Any] | None
+    review_quality_result: dict[str, Any] | None
+    review_logic_tokens: int
+    review_security_tokens: int
+    review_quality_tokens: int
+    review_aggregate_tokens: int
+    review_findings: list[dict[str, Any]]
     review_passed: bool
     review_round: int
     fix_attempt: int
@@ -107,7 +121,8 @@ async def node_diagnose(state: DebugWorkflowState) -> dict[str, Any]:
         f"{rag_ctx}\n\n"
         f"请进行系统性BUG诊断。如果能定位根因，输出包含五个部分的结构化问题分析报告。"
         f"如果信息不够，请在报告中明确指出缺少哪些信息，并请求添加日志打点。"
-        f"\n\n在报告末尾请用单独一行标注: [论据充足] 或 [论据不足]。"
+        f"\n\n报告末尾必须包含 debugger Prompt 规定的诊断判定数据 JSON。"
+        f"只有数据校验条件满足时才标注 [论据充足]，否则标注 [论据不足]。"
     )
 
     messages = build_node_messages(system_prompt, user_content)
@@ -119,19 +134,26 @@ async def node_diagnose(state: DebugWorkflowState) -> dict[str, Any]:
     except BudgetExceededError:
         result = "# 问题分析报告\n\n（预算超限，诊断未完成）\n\n[论据不足]\n"
 
-    diagnosis_sufficient = "[论据充足]" in result and "[论据不足]" not in result
+    diagnosis_sufficient, diagnosis_evidence = _evaluate_diagnosis_evidence(result)
 
     async with Database() as db:
         await db.add_artifact(sid, "diagnosis", result)
 
     from backend.fallback.engine import after_diagnosis
-    from backend.trace import record_fallback_decision
+    from backend.trace import record_event, record_fallback_decision
+    await record_event("diagnosis_evidence_check", "diagnose", diagnosis_evidence)
     await record_fallback_decision(after_diagnosis(diagnosis_sufficient), "diagnose")
 
-    logger.info(f"[{sid}] BUG诊断完成 (论据{'充足' if diagnosis_sufficient else '不足'})")
+    logger.info(
+        "[%s] BUG诊断完成 (数据校验%s，证据%d条)",
+        sid,
+        "通过" if diagnosis_sufficient else "未通过",
+        diagnosis_evidence["evidence_count"],
+    )
     return {
         "diagnosis_report": result,
         "diagnosis_sufficient": diagnosis_sufficient,
+        "diagnosis_evidence": diagnosis_evidence,
         "token_used": state.get("token_used", 0) +
         budget.total_input_tokens + budget.total_output_tokens,
     }
@@ -238,67 +260,56 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
     }
 
 
-async def node_review(state: DebugWorkflowState) -> dict[str, Any]:
-    """审查者节点：DEBUG工作流需要至少2轮审查"""
+async def node_review_start(state: DebugWorkflowState) -> dict[str, Any]:
+    """启动同一轮的三路独立审查。"""
     sid = state["session_id"]
     review_round = state.get("review_round", 0) + 1
-    required_rounds = REVIEW_ROUNDS_DEBUG
-
-    if review_round == 1:
-        angle = "逻辑正确性 + 边界条件与安全（第1轮）"
-    else:
-        angle = f"代码规范 + 整体合理性（第{review_round}轮）"
-
     await push_progress(sid, {"event": "progress", "stage": "review",
-                              "message": f"代码审查中 (第{review_round}轮, 侧重{angle})..."})
+                              "message": f"启动多视角代码审查（第{review_round}轮）..."})
+    return {}
 
-    system_prompt = load_system_prompt("reviewer") + (
-        f"\n\n这是DEBUG工作流的第 {review_round} 轮审查（共需至少{required_rounds}轮）。"
-        f"本轮的审查侧重: {angle}。"
-    )
-    rag_ctx = await inject_rag_context("reviewer",
-                                       (state.get("diagnosis_report") or "") + " " +
-                                       (state.get("implementation_note") or ""), state["project_path"])
 
-    code_changes_str = json.dumps(state.get("code_changes", {}), ensure_ascii=False, indent=2)
 
-    user_content = (
-        f"## 问题分析报告（原始BUG）\n{state['diagnosis_report']}\n\n"
-        f"## 代码变更\n```json\n{code_changes_str}\n```\n\n"
-        f"## 实现说明\n{state.get('implementation_note', '(无)')}\n\n"
-        f"{rag_ctx}\n\n"
-        f"请进行第{review_round}轮审查。关注维度: {angle}。"
-        f"请在审查报告开头明确标注结论: [审查通过] 或 [审查不通过]。"
-    )
+async def node_review_logic(state: DebugWorkflowState) -> dict[str, Any]:
+    """核对修复是否覆盖根因、逻辑和回归风险。"""
+    return await run_review_perspective(state, "logic", "debug")
 
-    messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
 
-    try:
-        result = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
-                                   state["project_path"])
-    except BudgetExceededError:
-        result = f"# 审查报告\n\n[审查不通过]\n\n（预算超限，第{review_round}轮审查未完成）\n"
+async def node_review_security(state: DebugWorkflowState) -> dict[str, Any]:
+    """核对修复是否引入安全和边界问题。"""
+    return await run_review_perspective(state, "security", "debug")
 
-    review_passed = "[审查通过]" in result and "[审查不通过]" not in result
+
+async def node_review_quality(state: DebugWorkflowState) -> dict[str, Any]:
+    """核对修复后的工程质量、测试和可维护性。"""
+    return await run_review_perspective(state, "quality", "debug")
+
+
+async def node_review_aggregate(state: DebugWorkflowState) -> dict[str, Any]:
+    """等待三路审查完成，确定性汇总并产生唯一的路由结论。"""
+    sid = state["session_id"]
+    aggregate = aggregate_review_reports(state, "debug", required_rounds=REVIEW_ROUNDS_DEBUG)
+    review_round = aggregate["review_round"]
+    review_passed = aggregate["review_passed"]
+    aggregate["token_used"] = state.get("token_used", 0) + aggregate["review_aggregate_tokens"]
 
     async with Database() as db:
-        await db.add_artifact(sid, "review", result)
+        await db.add_artifact(sid, "review", aggregate["review_report"])
 
     from backend.fallback.engine import after_review
-    from backend.trace import record_fallback_decision
-    await record_fallback_decision(after_review(
-        review_passed, review_round, required_rounds, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS,
-    ), "review")
-
-    logger.info(f"[{sid}] 审查完成 (第{review_round}轮, {'通过' if review_passed else '不通过'})")
-    return {
-        "review_report": result,
-        "review_passed": review_passed,
+    from backend.trace import record_event, record_fallback_decision
+    await record_event("review_aggregated", "review_aggregate", {
         "review_round": review_round,
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
-    }
+        "passed": review_passed,
+        "finding_count": len(aggregate["review_findings"]),
+        "perspectives": ["logic", "security", "quality"],
+    })
+    await record_fallback_decision(after_review(
+        review_passed, review_round, REVIEW_ROUNDS_DEBUG,
+        state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS,
+    ), "review_aggregate")
+    logger.info(f"[{sid}] 多视角审查完成 (第{review_round}轮, {'通过' if review_passed else '不通过'})")
+    return aggregate
 
 
 async def node_human_accept(state: DebugWorkflowState) -> dict[str, Any]:
@@ -385,7 +396,8 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
         f"- 变更文件数: {file_count}\n"
         f"- 审查轮次: {review_rounds}\n"
         f"- 总Token消耗: {total_tokens}\n"
-        f"- 诊断状态: {'论据充足' if diagnosis_sufficient else '需人工补充日志'}\n"
+        f"- 诊断状态: {'数据校验通过' if diagnosis_sufficient else '需人工补充日志'}\n"
+        f"- 可追溯证据数: {state.get('diagnosis_evidence', {}).get('evidence_count', 0)}\n"
         f"- 最终状态: {'审查通过' if state.get('review_passed') else '人工通过'}\n\n"
         f"## 变更文件\n"
         + "\n".join(f"- {fp}" for fp in code_changes.keys())
@@ -477,7 +489,11 @@ async def build_debug_workflow() -> StateGraph:
     workflow.add_node("human_wait", node_human_wait)
     workflow.add_node("fix", node_fix)
     workflow.add_node("validate", node_validate)
-    workflow.add_node("review", node_review)
+    workflow.add_node("review_start", node_review_start)
+    workflow.add_node("review_logic", node_review_logic)
+    workflow.add_node("review_security", node_review_security)
+    workflow.add_node("review_quality", node_review_quality)
+    workflow.add_node("review_aggregate", node_review_aggregate)
     workflow.add_node("human_accept", node_human_accept)
     workflow.add_node("human_intervene", node_human_intervene)
     workflow.add_node("output", node_output_summary)
@@ -497,12 +513,18 @@ async def build_debug_workflow() -> StateGraph:
     # 修复→审查
     workflow.add_edge("fix", "validate")
     workflow.add_conditional_edges("validate", route_after_validation, {
-        "review": "review", "fix": "fix", "human_intervene": "human_intervene",
+        "review": "review_start", "fix": "fix", "human_intervene": "human_intervene",
     })
 
-    # 审查后条件分支：继续审查/修复/验收
-    workflow.add_conditional_edges("review", route_after_review, {
-        "review": "review",
+    # 同一轮的三个审查视角并行执行，汇总节点等待全部结果。
+    workflow.add_edge("review_start", "review_logic")
+    workflow.add_edge("review_start", "review_security")
+    workflow.add_edge("review_start", "review_quality")
+    workflow.add_edge(["review_logic", "review_security", "review_quality"], "review_aggregate")
+
+    # 汇总审查后条件分支：继续审查/修复/验收
+    workflow.add_conditional_edges("review_aggregate", route_after_review, {
+        "review": "review_start",
         "fix": "fix",
         "human_accept": "human_accept",
         "human_intervene": "human_intervene",
@@ -523,6 +545,105 @@ async def build_debug_workflow() -> StateGraph:
 
 
 # ---- 辅助函数 ----
+
+_DIAGNOSIS_EVIDENCE_PATTERN = re.compile(
+    r"##\s*诊断判定数据\s*\n(?P<fence>[\x60~]{3})json\s*(?P<body>.*?)\s*(?P=fence)",
+    re.DOTALL,
+)
+_EVIDENCE_SOURCES = {"code", "log", "runtime", "test", "history"}
+_MIN_DIAGNOSIS_CONFIDENCE = 0.75
+_MIN_DIAGNOSIS_EVIDENCE_COUNT = 2
+
+
+def _evaluate_diagnosis_evidence(report: str) -> tuple[bool, dict[str, Any]]:
+    """解析并校验诊断数据，避免仅凭模型文本标签进入修复。"""
+    checks_failed: list[str] = []
+    match = _DIAGNOSIS_EVIDENCE_PATTERN.search(report)
+    if not match:
+        return False, {
+            "passed": False,
+            "evidence_count": 0,
+            "evidence_sources": [],
+            "failed_checks": ["missing_diagnosis_evidence_json"],
+        }
+
+    try:
+        payload = json.loads(match.group("body"))
+    except json.JSONDecodeError:
+        return False, {
+            "passed": False,
+            "evidence_count": 0,
+            "evidence_sources": [],
+            "failed_checks": ["invalid_diagnosis_evidence_json"],
+        }
+
+    if not isinstance(payload, dict):
+        return False, {
+            "passed": False,
+            "evidence_count": 0,
+            "evidence_sources": [],
+            "failed_checks": ["diagnosis_evidence_not_object"],
+        }
+
+    root_cause = payload.get("root_cause")
+    repair_direction = payload.get("repair_direction")
+    confidence = payload.get("confidence")
+    missing_information = payload.get("missing_information")
+    evidence = payload.get("evidence")
+    if not isinstance(root_cause, str) or not root_cause.strip():
+        checks_failed.append("missing_root_cause")
+    if not isinstance(repair_direction, str) or not repair_direction.strip():
+        checks_failed.append("missing_repair_direction")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)):
+        checks_failed.append("invalid_confidence")
+    elif not 0 <= float(confidence) <= 1:
+        checks_failed.append("confidence_out_of_range")
+    elif float(confidence) < _MIN_DIAGNOSIS_CONFIDENCE:
+        checks_failed.append("confidence_below_threshold")
+    if not isinstance(missing_information, list) or any(
+        not isinstance(item, str) for item in missing_information
+    ):
+        checks_failed.append("invalid_missing_information")
+    elif missing_information:
+        checks_failed.append("missing_information_present")
+    if not isinstance(evidence, list):
+        evidence = []
+        checks_failed.append("invalid_evidence")
+
+    evidence_sources: list[str] = []
+    valid_evidence_count = 0
+    for item in evidence:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("source")
+        reference = item.get("reference")
+        detail = item.get("detail")
+        if (
+            isinstance(source, str)
+            and source in _EVIDENCE_SOURCES
+            and isinstance(reference, str)
+            and reference.strip()
+            and isinstance(detail, str)
+            and detail.strip()
+        ):
+            valid_evidence_count += 1
+            evidence_sources.append(source)
+    if valid_evidence_count < _MIN_DIAGNOSIS_EVIDENCE_COUNT:
+        checks_failed.append("insufficient_traceable_evidence")
+    if "[论据充足]" not in report or "[论据不足]" in report:
+        checks_failed.append("inconsistent_evidence_label")
+
+    evidence_data = {
+        "passed": not checks_failed,
+        "root_cause": root_cause if isinstance(root_cause, str) else "",
+        "repair_direction": repair_direction if isinstance(repair_direction, str) else "",
+        "confidence": float(confidence) if isinstance(confidence, (int, float)) and not isinstance(confidence, bool) else None,
+        "evidence_count": valid_evidence_count,
+        "evidence_sources": evidence_sources,
+        "missing_information": missing_information if isinstance(missing_information, list) else [],
+        "failed_checks": checks_failed,
+    }
+    return not checks_failed, evidence_data
 
 def _parse_developer_output(text: str) -> tuple[dict[str, str], str]:
     """从开发者输出文本中解析代码变更和实现说明"""

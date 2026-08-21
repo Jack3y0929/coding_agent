@@ -97,7 +97,7 @@ async def hybrid_retrieve_for_role(
     角色 → 检索策略：
     - analyst: 历史任务 (memory) top 3
     - developer: 源码 (file) top 8 + 历史任务 top 2
-    - reviewer: 规范 (spec) top 5
+    - reviewer/review_*: 规范 (spec) top 5 + 历史错误 top 3
     - debugger: 源码 top 8 + 历史错误 top 3
     """
     if role == "analyst":
@@ -106,7 +106,7 @@ async def hybrid_retrieve_for_role(
         code_results = await hybrid_retrieve(query, top_k=8, source_type="file")
         mem_results = await hybrid_retrieve(query, top_k=2, source_type="memory")
         results = code_results + mem_results
-    elif role == "reviewer":
+    elif role in ("reviewer", "review_logic", "review_security", "review_quality"):
         results = await hybrid_retrieve(query, top_k=5, source_type="spec")
         # 同时检索错误模式库
         error_results = await hybrid_retrieve(query, top_k=3, source_type="error")

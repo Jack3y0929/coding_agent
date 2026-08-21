@@ -20,6 +20,7 @@ from backend.graph.nodes import (
     load_system_prompt,
     run_fc_loop,
 )
+from backend.graph.review import aggregate_review_reports, run_review_perspective
 from backend.rag.retriever import init_spec_library
 
 logger = logging.getLogger("graph.dev")
@@ -38,6 +39,17 @@ class DevWorkflowState(TypedDict):
     code_changes: dict[str, str] | None
     implementation_note: str | None
     review_report: str | None
+    review_logic_report: str | None
+    review_security_report: str | None
+    review_quality_report: str | None
+    review_logic_result: dict[str, Any] | None
+    review_security_result: dict[str, Any] | None
+    review_quality_result: dict[str, Any] | None
+    review_logic_tokens: int
+    review_security_tokens: int
+    review_quality_tokens: int
+    review_aggregate_tokens: int
+    review_findings: list[dict[str, Any]]
     review_passed: bool
     review_round: int
     fix_attempt: int
@@ -205,61 +217,55 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
     }
 
 
-async def node_review(state: DevWorkflowState) -> dict[str, Any]:
-    """审查者节点：独立上下文，四维审查"""
+async def node_review_start(state: DevWorkflowState) -> dict[str, Any]:
+    """启动同一轮的三路独立审查。"""
     sid = state["session_id"]
     review_round = state.get("review_round", 0) + 1
-
-    angle = "逻辑正确性 + 边界条件与安全" if review_round == 1 else "代码规范 + 整体合理性 + 安全复查"
     await push_progress(sid, {"event": "progress", "stage": "review",
-                              "message": f"代码审查中 (第{review_round}轮, 侧重{angle})..."})
+                              "message": f"启动多视角代码审查（第{review_round}轮）..."})
+    return {}
 
-    system_prompt = load_system_prompt("reviewer") + (
-        f"\n\n当前是第 {review_round} 轮审查。本轮的审查侧重: {angle}。"
-    )
-    rag_ctx = await inject_rag_context("reviewer",
-                                       (state["requirement_doc"] or "") + " " +
-                                       (state["implementation_note"] or ""), state["project_path"])
 
-    code_changes_str = json.dumps(state.get("code_changes", {}), ensure_ascii=False, indent=2)
 
-    user_content = (
-        f"## 需求概括文档\n{state['requirement_doc']}\n\n"
-        f"## 代码变更\n```json\n{code_changes_str}\n```\n\n"
-        f"## 实现说明\n{state.get('implementation_note', '(无)')}\n\n"
-        f"{rag_ctx}\n\n"
-        f"请进行第{review_round}轮审查。关注维度: {angle}。"
-        f"请在审查报告开头明确标注结论: [审查通过] 或 [审查不通过]。"
-    )
+async def node_review_logic(state: DevWorkflowState) -> dict[str, Any]:
+    """逻辑与需求符合性审查。"""
+    return await run_review_perspective(state, "logic", "dev")
 
-    messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
 
-    try:
-        result = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
-                                   state["project_path"])
-    except BudgetExceededError:
-        result = "# 审查报告\n\n[审查不通过]\n\n（预算超限，审查未完成）\n"
+async def node_review_security(state: DevWorkflowState) -> dict[str, Any]:
+    """安全与边界防护审查。"""
+    return await run_review_perspective(state, "security", "dev")
 
-    review_passed = "[审查通过]" in result and "[审查不通过]" not in result
+
+async def node_review_quality(state: DevWorkflowState) -> dict[str, Any]:
+    """工程质量与可维护性审查。"""
+    return await run_review_perspective(state, "quality", "dev")
+
+
+async def node_review_aggregate(state: DevWorkflowState) -> dict[str, Any]:
+    """等待三路审查完成，确定性汇总并产生唯一的路由结论。"""
+    sid = state["session_id"]
+    aggregate = aggregate_review_reports(state, "dev", required_rounds=1)
+    review_round = aggregate["review_round"]
+    review_passed = aggregate["review_passed"]
+    aggregate["token_used"] = state.get("token_used", 0) + aggregate["review_aggregate_tokens"]
 
     async with Database() as db:
-        await db.add_artifact(sid, "review", result)
+        await db.add_artifact(sid, "review", aggregate["review_report"])
 
     from backend.fallback.engine import after_review
-    from backend.trace import record_fallback_decision
+    from backend.trace import record_event, record_fallback_decision
+    await record_event("review_aggregated", "review_aggregate", {
+        "review_round": review_round,
+        "passed": review_passed,
+        "finding_count": len(aggregate["review_findings"]),
+        "perspectives": ["logic", "security", "quality"],
+    })
     await record_fallback_decision(after_review(
         review_passed, review_round, 1, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS,
-    ), "review")
-
-    logger.info(f"[{sid}] 审查完成 (第{review_round}轮, {'通过' if review_passed else '不通过'})")
-    return {
-        "review_report": result,
-        "review_passed": review_passed,
-        "review_round": review_round,
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
-    }
+    ), "review_aggregate")
+    logger.info(f"[{sid}] 多视角审查完成 (第{review_round}轮, {'通过' if review_passed else '不通过'})")
+    return aggregate
 
 
 async def node_validate(state: DevWorkflowState) -> dict[str, Any]:
@@ -474,7 +480,11 @@ async def build_dev_workflow() -> StateGraph:
     workflow.add_node("develop_plan", node_develop_plan)
     workflow.add_node("develop_build", node_develop_build)
     workflow.add_node("validate", node_validate)
-    workflow.add_node("review", node_review)
+    workflow.add_node("review_start", node_review_start)
+    workflow.add_node("review_logic", node_review_logic)
+    workflow.add_node("review_security", node_review_security)
+    workflow.add_node("review_quality", node_review_quality)
+    workflow.add_node("review_aggregate", node_review_aggregate)
     workflow.add_node("fix", node_fix)
     workflow.add_node("human_accept", node_human_accept)
     workflow.add_node("human_intervene", node_human_intervene)
@@ -489,14 +499,20 @@ async def build_dev_workflow() -> StateGraph:
     workflow.add_edge("develop_plan", "develop_build")
     workflow.add_edge("develop_build", "validate")
     workflow.add_conditional_edges("validate", route_after_validation, {
-        "review": "review", "fix": "fix", "human_intervene": "human_intervene",
+        "review": "review_start", "fix": "fix", "human_intervene": "human_intervene",
     })
 
-    # 审查后的条件分支
-    workflow.add_conditional_edges("review", route_after_review, {
+    # 同一轮的三个审查视角并行执行，汇总节点等待全部结果。
+    workflow.add_edge("review_start", "review_logic")
+    workflow.add_edge("review_start", "review_security")
+    workflow.add_edge("review_start", "review_quality")
+    workflow.add_edge(["review_logic", "review_security", "review_quality"], "review_aggregate")
+
+    # 汇总审查后的条件分支
+    workflow.add_conditional_edges("review_aggregate", route_after_review, {
         "fix": "fix",
         "human_accept": "human_accept",
-        "review": "review",
+        "review": "review_start",
         "human_intervene": "human_intervene",
     })
     workflow.add_edge("fix", "validate")
