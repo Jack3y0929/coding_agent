@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import re
+import hashlib
 from typing import Optional
 
 import numpy as np
 
-from backend.config import EMBEDDING_MODEL
+from backend.config import EMBEDDING_MODEL, RAG_EMBEDDING_BACKEND
 
 logger = logging.getLogger("rag.embedding")
 
@@ -17,6 +19,7 @@ class EmbeddingEngine:
         self.model_name = model_name
         self._model: Optional[object] = None
         self.dimension: int = 384  # all-MiniLM-L6-v2 输出维度
+        self._use_hash = RAG_EMBEDDING_BACKEND.lower() in {"hash", "fallback"}
 
     def _load_model(self) -> object:
         """延迟加载模型"""
@@ -35,6 +38,8 @@ class EmbeddingEngine:
 
     def encode(self, text: str | list[str]) -> np.ndarray:
         """将文本编码为向量"""
+        if self._use_hash:
+            return self._hash_encode(text)
         model = self._load_model()
         is_single = isinstance(text, str)
         if is_single:
@@ -47,6 +52,21 @@ class EmbeddingEngine:
         if is_single:
             return embeddings[0]
         return embeddings
+
+    def _hash_encode(self, text: str | list[str]) -> np.ndarray:
+        """无模型时的确定性词袋向量，保证本地离线 RAG 仍可工作。"""
+        values = [text] if isinstance(text, str) else text
+        matrix = np.zeros((len(values), self.dimension), dtype=np.float32)
+        for row, value in enumerate(values):
+            tokens = re.findall(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]", str(value).lower())
+            for token in tokens:
+                digest = hashlib.blake2b(token.encode("utf-8"), digest_size=8).digest()
+                index = int.from_bytes(digest[:4], "little") % self.dimension
+                matrix[row, index] += 1.0
+            norm = np.linalg.norm(matrix[row])
+            if norm:
+                matrix[row] /= norm
+        return matrix[0] if isinstance(text, str) else matrix
 
     def encode_to_bytes(self, text: str) -> bytes:
         """将文本编码后转为字节（用于SQLite BLOB存储）"""

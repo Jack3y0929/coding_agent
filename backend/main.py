@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from backend.config import PROJECT_ROOT
+from backend.project_scope import real_project_path
 from backend.graph.context import (
     push_progress,
     register_ws,
@@ -62,6 +63,11 @@ class ResumeRequest(BaseModel):
     expected_behavior: str = ""
 
 
+class HumanDecisionRequest(BaseModel):
+    """轻量人工验收接口请求体。"""
+    note: str = ""
+
+
 class TraceLabelRequest(BaseModel):
     outcome: str
     requirement_fit: str | None = None
@@ -90,6 +96,11 @@ async def start_workflow(req: StartWorkflowRequest) -> dict[str, Any]:
     session_id = str(uuid.uuid4())[:8]
     if req.workflow_type not in (None, "dev", "debug"):
         return {"error": f"无效的工作流类型: {req.workflow_type}"}
+    try:
+        normalized_project = real_project_path(req.project_path)
+    except (ValueError, OSError) as exc:
+        return {"error": f"项目路径无效: {exc}"}
+    req = req.model_copy(update={"project_path": normalized_project})
     logger.info(f"启动工作流 session={session_id} type={req.workflow_type or 'auto'}")
     asyncio.create_task(run_workflow_async(session_id, req))
     return {"session_id": session_id, "status": "started", "workflow_type": req.workflow_type or "auto"}
@@ -99,11 +110,13 @@ async def start_workflow(req: StartWorkflowRequest) -> dict[str, Any]:
 async def get_status(session_id: str) -> dict[str, Any]:
     """查询工作流当前状态"""
     from backend.db.models import get_session, get_artifacts_by_session
+    from backend.graph.context import get_progress_snapshot
     async with get_session() as db_session:
         session_data = await db_session.get_session(session_id)
         if not session_data:
             return {"error": "会话不存在", "session_id": session_id}
         artifacts = await db_session.get_artifacts_by_session(session_id)
+        progress = get_progress_snapshot(session_id) or {}
         return {
             "session_id": session_data["id"],
             "type": session_data["type"],
@@ -113,7 +126,53 @@ async def get_status(session_id: str) -> dict[str, Any]:
                 {"type": a["type"], "created_at": a["created_at"]}
                 for a in artifacts
             ],
+            "progress": progress,
         }
+
+
+@app.get("/api/workflow/events/{session_id}")
+async def get_workflow_events(session_id: str) -> dict[str, Any]:
+    """按会话返回完整 Trace 时间线和正式产物。"""
+    from backend.db.models import init_db
+    from backend.trace import get_trace_by_session
+    await init_db()
+    trace = await get_trace_by_session(session_id)
+    if not trace:
+        return {"error": "会话不存在", "session_id": session_id}
+    return {"session_id": session_id, "trace_id": trace["trace_id"],
+            "events": trace["events"], "artifacts": trace["artifacts"]}
+
+
+@app.get("/api/workflow/quality/{session_id}")
+async def get_workflow_quality(session_id: str) -> dict[str, Any]:
+    """返回单次工作流的确定性质量指标。"""
+    from backend.db.models import init_db
+    from backend.trace import get_trace_by_session
+    from backend.evaluation.service import evaluate_trace
+    await init_db()
+    trace = await get_trace_by_session(session_id)
+    if not trace:
+        return {"error": "会话不存在", "session_id": session_id}
+    metrics = await evaluate_trace(trace["trace_id"])
+    return {"session_id": session_id, "trace_id": trace["trace_id"], "metrics": metrics}
+
+
+async def _resume_endpoint(session_id: str, decision: str, note: str = "") -> dict[str, str]:
+    from backend.graph.context import resume_session
+    ok = resume_session(session_id, decision, feedback={"outcome": "approved" if decision == "approved" else "rejected", "note": note})
+    if not ok:
+        return {"status": "error", "message": "无等待中的会话", "session_id": session_id}
+    return {"status": "resumed", "session_id": session_id}
+
+
+@app.post("/api/workflow/accept/{session_id}")
+async def accept_workflow(session_id: str, req: HumanDecisionRequest | None = None) -> dict[str, str]:
+    return await _resume_endpoint(session_id, "approved", req.note if req else "")
+
+
+@app.post("/api/workflow/reject/{session_id}")
+async def reject_workflow(session_id: str, req: HumanDecisionRequest | None = None) -> dict[str, str]:
+    return await _resume_endpoint(session_id, "rejected", req.note if req else "")
 
 
 @app.get("/api/traces")
@@ -232,7 +291,7 @@ async def websocket_progress(websocket: WebSocket, session_id: str) -> None:
 # ---- 工作流运行器 ----
 async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None:
     """后台异步运行工作流"""
-    from backend.budget import BudgetExceededError, TokenBudget
+    from backend.budget import BudgetExceededError, TokenBudget, bind_budget, unbind_budget
     from backend.db.models import Database, init_db, create_session, update_session_status
     from backend.intent.context import bind_intent, unbind_intent
     from backend.intent.rules import validate_slots
@@ -243,7 +302,9 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
     budget = TokenBudget()
     trace_token = None
     intent_token = None
+    budget_token = bind_budget(budget)
     try:
+        req = req.model_copy(update={"project_path": real_project_path(req.project_path)})
         await init_db()
         requested_workflow = req.workflow_type or "auto"
         await create_session(
@@ -362,6 +423,7 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "token_status": budget.get_status(),
         })
     finally:
+        unbind_budget(budget_token)
         if intent_token is not None:
             unbind_intent(intent_token)
         if trace_token is not None:
@@ -402,4 +464,5 @@ async def _handle_graph_event(session_id: str, event: dict[str, Any], budget: An
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8000, reload=True)
+    # 与 frontend/vite.config.js 的开发代理保持一致。
+    uvicorn.run("backend.main:app", host="0.0.0.0", port=8001, reload=True)

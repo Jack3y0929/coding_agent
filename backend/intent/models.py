@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
@@ -44,5 +44,6 @@ class SlotValidationResult(BaseModel):
     missing_slots: list[str] = Field(default_factory=list)
     warnings: list[str] = Field(default_factory=list)
     clarification_questions: list[str] = Field(default_factory=list)
+    clarification_options: list[dict[str, Any]] = Field(default_factory=list)
     manual_selection_conflict: bool = False
     selected_workflow_type: Literal["dev", "debug"]

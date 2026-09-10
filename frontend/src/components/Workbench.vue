@@ -40,6 +40,7 @@ async function submitWorkflow() {
       emit('started', {
         session_id: data.session_id,
         workflow_type: workflowType.value,
+        project_path: projectPath.value,
       })
     }
   } catch (e) {

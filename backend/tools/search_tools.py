@@ -4,6 +4,7 @@ import logging
 import os
 import re
 from typing import Any, Optional
+from backend.project_scope import real_project_path
 
 logger = logging.getLogger("tools.search")
 
@@ -15,9 +16,18 @@ _SOURCE_EXTENSIONS = {".py", ".js", ".ts", ".vue", ".jsx", ".tsx", ".rs",
 
 async def search_code(pattern: str, file_pattern: str | None = None,
                       directory: str | None = None,
-                      max_results: int = 50) -> str:
+                      max_results: int = 50,
+                      project_path: str | None = None) -> str:
     """在项目源码中搜索匹配正则表达式的内容"""
-    search_dir = directory or os.getcwd()
+    try:
+        scope = real_project_path(project_path) if project_path else None
+    except ValueError as exc:
+        return f"错误: 项目路径无效 — {exc}"
+    search_dir = scope or directory or os.getcwd()
+    if scope and directory:
+        candidate = os.path.realpath(os.path.abspath(directory))
+        if os.path.commonpath([scope, candidate]) != scope:
+            return f"错误: 搜索目录不在项目范围内 — {directory}"
     if not os.path.isdir(search_dir):
         return f"错误: 目录不存在 — {search_dir}"
 

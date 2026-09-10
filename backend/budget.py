@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import contextvars
 from typing import Any
 
 from backend.config import MAX_COST_YUAN
@@ -18,6 +19,11 @@ except Exception as exc:
 class BudgetExceededError(Exception):
     """预算超限异常"""
     pass
+
+
+_active_budget: contextvars.ContextVar["TokenBudget | None"] = contextvars.ContextVar(
+    "active_workflow_budget", default=None
+)
 
 
 class TokenBudget:
@@ -91,6 +97,21 @@ class TokenBudget:
     def _calc_cost(self, input_tokens: int, output_tokens: int) -> float:
         return (input_tokens / 1_000_000 * self.DEEPSEEK_INPUT_PRICE +
                 output_tokens / 1_000_000 * self.DEEPSEEK_OUTPUT_PRICE)
+
+
+def bind_budget(budget: TokenBudget) -> contextvars.Token[TokenBudget | None]:
+    """将一个预算对象绑定到当前工作流，确保所有节点共享同一上限。"""
+    return _active_budget.set(budget)
+
+
+def unbind_budget(token: contextvars.Token[TokenBudget | None]) -> None:
+    """清理当前工作流的预算绑定。"""
+    _active_budget.reset(token)
+
+
+def get_workflow_budget() -> TokenBudget:
+    """返回当前工作流预算；独立函数调用时使用新的本地预算。"""
+    return _active_budget.get() or TokenBudget()
 
 
 def _estimate_tokens(text: str) -> int:

@@ -64,12 +64,18 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 relevance_score REAL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
                 last_recalled_at TEXT DEFAULT NULL
+                ,project_path TEXT NOT NULL DEFAULT ''
             );
 
             CREATE TABLE IF NOT EXISTS rag_embeddings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 source_type TEXT NOT NULL CHECK(source_type IN ('file', 'memory', 'error', 'spec')),
                 source_path TEXT NOT NULL,
+                project_path TEXT NOT NULL DEFAULT '',
+                file_hash TEXT DEFAULT NULL,
+                mtime REAL DEFAULT NULL,
+                size INTEGER DEFAULT NULL,
+                symbol TEXT DEFAULT NULL,
                 chunk_index INTEGER NOT NULL DEFAULT 0,
                 content TEXT NOT NULL,
                 embedding BLOB DEFAULT NULL,
@@ -141,6 +147,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
             CREATE INDEX IF NOT EXISTS idx_rag_source ON rag_embeddings(source_path);
+            CREATE INDEX IF NOT EXISTS idx_rag_project_source ON rag_embeddings(project_path, source_path);
             CREATE INDEX IF NOT EXISTS idx_rag_type ON rag_embeddings(source_type);
             CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memory(category);
             CREATE INDEX IF NOT EXISTS idx_trace_session ON workflow_traces(session_id, started_at);
@@ -172,6 +179,22 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
     for name, definition in migrations.items():
         if name not in columns:
             await db.execute(f"ALTER TABLE long_term_memory ADD COLUMN {name} {definition}")
+    cursor = await db.execute("PRAGMA table_info(rag_embeddings)")
+    rag_columns = {row[1] for row in await cursor.fetchall()}
+    rag_migrations = {
+        "project_path": "TEXT NOT NULL DEFAULT ''",
+        "file_hash": "TEXT DEFAULT NULL",
+        "mtime": "REAL DEFAULT NULL",
+        "size": "INTEGER DEFAULT NULL",
+        "symbol": "TEXT DEFAULT NULL",
+    }
+    for name, definition in rag_migrations.items():
+        if name not in rag_columns:
+            await db.execute(f"ALTER TABLE rag_embeddings ADD COLUMN {name} {definition}")
+    cursor = await db.execute("PRAGMA table_info(long_term_memory)")
+    memory_columns = {row[1] for row in await cursor.fetchall()}
+    if "project_path" not in memory_columns:
+        await db.execute("ALTER TABLE long_term_memory ADD COLUMN project_path TEXT NOT NULL DEFAULT ''")
 
 
 class Database:
@@ -283,11 +306,12 @@ class Database:
 
     async def insert_long_term_memory(self, category: str, title: str, content: str,
                                       embedding: Optional[bytes] = None,
-                                      source_session_id: Optional[str] = None) -> int:
+                                      source_session_id: Optional[str] = None,
+                                      project_path: str = "") -> int:
         cursor = await self._conn.execute(
             "INSERT INTO long_term_memory (category, title, content, embedding, "
-            "source_session_id, created_at) VALUES (?, ?, ?, ?, ?, ?)",
-            (category, title, content, embedding, source_session_id, _now()),
+            "source_session_id, project_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (category, title, content, embedding, source_session_id, project_path, _now()),
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -332,14 +356,19 @@ class Database:
     async def insert_rag_embedding(self, source_type: str, source_path: str,
                                    chunk_index: int, content: str,
                                    embedding: Optional[bytes] = None,
-                                   token_count: int = 0) -> int:
+                                   token_count: int = 0,
+                                   project_path: str = "",
+                                   file_hash: Optional[str] = None,
+                                   mtime: Optional[float] = None,
+                                   size: Optional[int] = None,
+                                   symbol: Optional[str] = None) -> int:
         now = _now()
         cursor = await self._conn.execute(
-            "INSERT INTO rag_embeddings (source_type, source_path, chunk_index, "
+            "INSERT INTO rag_embeddings (source_type, source_path, project_path, file_hash, mtime, size, symbol, chunk_index, "
             "content, embedding, token_count, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (source_type, source_path, chunk_index, content, embedding,
-             token_count, now, now),
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (source_type, source_path, project_path, file_hash, mtime, size, symbol,
+             chunk_index, content, embedding, token_count, now, now),
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -353,11 +382,31 @@ class Database:
         )
         await self._conn.commit()
 
-    async def delete_rag_by_source(self, source_path: str) -> None:
-        await self._conn.execute(
-            "DELETE FROM rag_embeddings WHERE source_path = ?", (source_path,)
-        )
+    async def delete_rag_by_source(self, source_path: str, project_path: Optional[str] = None) -> None:
+        if project_path is None:
+            await self._conn.execute("DELETE FROM rag_embeddings WHERE source_path = ?", (source_path,))
+        else:
+            await self._conn.execute("DELETE FROM rag_embeddings WHERE source_path = ? AND project_path = ?",
+                                     (source_path, project_path))
         await self._conn.commit()
+
+    async def get_rag_file_metadata(self, source_path: str, project_path: str) -> Optional[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT project_path, source_path, file_hash, mtime, size FROM rag_embeddings "
+            "WHERE source_path = ? AND project_path = ? ORDER BY id LIMIT 1",
+            (source_path, project_path),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_rag_sources(self, project_path: str, source_type: Optional[str] = "file") -> list[dict[str, Any]]:
+        sql = "SELECT DISTINCT source_path, project_path, file_hash, mtime, size FROM rag_embeddings WHERE project_path = ?"
+        params: list[Any] = [project_path]
+        if source_type:
+            sql += " AND source_type = ?"
+            params.append(source_type)
+        cursor = await self._conn.execute(sql, tuple(params))
+        return [dict(row) for row in await cursor.fetchall()]
 
     async def has_source_path(self, source_path: str) -> bool:
         cursor = await self._conn.execute(
@@ -368,27 +417,32 @@ class Database:
         return row[0] > 0 if row else False
 
     async def get_all_rag_embeddings(self,
-                                     source_type: Optional[str] = None) -> list[dict[str, Any]]:
+                                     source_type: Optional[str] = None,
+                                     project_path: Optional[str] = None) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
         if source_type:
-            cursor = await self._conn.execute(
-                "SELECT * FROM rag_embeddings WHERE source_type = ?", (source_type,)
-            )
-        else:
-            cursor = await self._conn.execute("SELECT * FROM rag_embeddings")
+            clauses.append("source_type = ?"); params.append(source_type)
+        if project_path is not None:
+            clauses.append("project_path = ?"); params.append(project_path)
+        sql = "SELECT * FROM rag_embeddings" + ((" WHERE " + " AND ".join(clauses)) if clauses else "")
+        cursor = await self._conn.execute(sql, tuple(params))
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
-    async def get_rag_by_source(self, source_path: str) -> list[dict[str, Any]]:
+    async def get_rag_by_source(self, source_path: str, project_path: Optional[str] = None) -> list[dict[str, Any]]:
+        params: tuple[Any, ...] = (source_path,) if project_path is None else (source_path, project_path)
+        condition = "source_path = ?" + (" AND project_path = ?" if project_path is not None else "")
         cursor = await self._conn.execute(
-            "SELECT * FROM rag_embeddings WHERE source_path = ? ORDER BY chunk_index",
-            (source_path,),
+            f"SELECT * FROM rag_embeddings WHERE {condition} ORDER BY chunk_index", params,
         )
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
     async def keyword_search_rag(self, keywords: str,
                                  source_type: Optional[str] = None,
-                                 limit: int = 20) -> list[dict[str, Any]]:
+                                 limit: int = 20,
+                                 project_path: Optional[str] = None) -> list[dict[str, Any]]:
         """关键词搜索 RAG 索引"""
         kw_list = [kw.strip() for kw in keywords.split() if kw.strip()]
         if not kw_list:
@@ -402,6 +456,9 @@ class Database:
         if source_type:
             condition = f"({condition}) AND source_type = ?"
             params.append(source_type)
+        if project_path is not None:
+            condition = f"({condition}) AND project_path = ?"
+            params.append(project_path)
 
         sql = (f"SELECT * FROM rag_embeddings WHERE {condition} "
                f"ORDER BY updated_at DESC LIMIT ?")

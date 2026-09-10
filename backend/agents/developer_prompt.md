@@ -21,6 +21,13 @@
 - 写入后执行编译检查（白名单内命令）
 - **Build模式下所有操作需通过安全校验**
 
+#### Shell命令与验证目录
+- `execute_shell` 会自动使用当前任务的 `project_path` 作为工作目录；不要在命令中执行 `cd`、`dir`、`ls`、`pwd`、`Set-Location`。
+- 不要使用 `&&`、`||`、`;`、管道或重定向组合命令；源码浏览使用 `read_file` / `search_code`。
+- 验证命令必须从项目根目录直接执行。前端项目位于 `frontend` 子目录时，使用 `npm run build --prefix frontend`、`npm run lint --prefix frontend` 或 `npm run typecheck --prefix frontend`。
+- Python 测试使用 `pytest` 或 `python -m pytest`；Git 检查使用 `git status`、`git diff`、`git log --oneline`。
+- 输出验证命令前，确认命令以 Shell 白名单中的前缀开头，并且不要把 `npm run build` 用于没有 `package.json` 的项目根目录。
+
 ## 输入
 
 | 节点 | 输入内容 |

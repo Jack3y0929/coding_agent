@@ -6,7 +6,7 @@ const props = defineProps({
   workflowType: String,
 })
 
-const emit = defineEmits(['back'])
+const emit = defineEmits(['back', 'finished'])
 
 const stages = ref([])
 const currentStage = ref('')
@@ -18,10 +18,12 @@ const isPaused = ref(false)
 const pauseStage = ref('')
 const summaryMessage = ref('')
 const errorMessage = ref('')
+const traceEvents = ref([])
 const acceptance = ref(defaultAcceptance())
 const intentInfo = ref(null)
 const intentValidation = ref(null)
 const slotForm = ref(defaultSlots())
+const selectedClarifications = ref({})
 
 function defaultAcceptance() {
   return {
@@ -122,6 +124,10 @@ function connectWebSocket() {
 function handleProgress(data) {
   if (data.token_status) tokenStatus.value = data.token_status
 
+  if (data.event === 'trace' && data.trace) {
+    mergeTraceEvents([data.trace])
+  }
+
   if (data.event === 'progress' && data.stage) {
     currentStage.value = data.stage
     currentMessage.value = data.stage_name || data.message || ''
@@ -142,6 +148,7 @@ function handleProgress(data) {
   if (data.stage === 'intent_clarify') {
     intentInfo.value = data.intent || intentInfo.value
     intentValidation.value = data.validation || intentValidation.value
+    selectedClarifications.value = {}
     if (intentInfo.value) {
       slotForm.value = {
         intent_workflow_type: '',
@@ -170,12 +177,61 @@ function handleProgress(data) {
     currentMessage.value = '工作流执行完成'
     if (data.summary) summaryMessage.value = data.summary
     stages.value.forEach(s => { s.done = true; s.active = false })
+    emit('finished')
   }
 
   if (data.event === 'error') {
     isError.value = true
     errorMessage.value = data.message
     isPaused.value = false
+    emit('finished')
+  }
+}
+
+function mergeTraceEvents(events) {
+  const merged = new Map(traceEvents.value.map(item => [item.id, item]))
+  events.forEach(item => {
+    if (item?.id != null) merged.set(item.id, item)
+  })
+  traceEvents.value = [...merged.values()].sort((a, b) => (a.id || 0) - (b.id || 0))
+}
+
+async function restoreTraceEvents() {
+  if (!props.sessionId) return
+  try {
+    const response = await fetch(`/api/workflow/events/${encodeURIComponent(props.sessionId)}`)
+    const data = await response.json()
+    if (!data.error) mergeTraceEvents(data.events || [])
+  } catch (error) {
+    console.warn('恢复 Trace 事件失败:', error)
+  }
+}
+
+function tracePayload(event) {
+  return JSON.stringify(event.payload || {}, null, 2)
+}
+
+function chooseClarification(option) {
+  const value = option.value
+  selectedClarifications.value = {
+    ...selectedClarifications.value,
+    [option.slot]: value,
+  }
+  if (option.slot === 'workflow_type') slotForm.value.intent_workflow_type = value
+}
+
+async function restoreStatus() {
+  if (!props.sessionId) return
+  try {
+    const response = await fetch(`/api/workflow/status/${encodeURIComponent(props.sessionId)}`)
+    const data = await response.json()
+    if (data.error) return
+    const progress = data.progress || {}
+    if (progress.stage || progress.event) handleProgress(progress)
+    if (data.status === 'done') handleProgress({ event: 'complete', stage: 'output' })
+    if (data.status === 'failed') handleProgress({ event: 'error', message: '工作流执行失败' })
+  } catch (error) {
+    console.warn('恢复工作流状态失败:', error)
   }
 }
 
@@ -190,19 +246,8 @@ async function sendDecision(decision) {
       delete payload.issue_types_text
     }
     if (pauseStage.value === 'intent_clarify') {
-      Object.assign(payload, {
-        ...slotForm.value,
-        target_modules: splitLines(slotForm.value.target_modules_text),
-        change_scope: splitLines(slotForm.value.change_scope_text),
-        protected_paths: splitLines(slotForm.value.protected_paths_text),
-        acceptance_criteria: splitLines(slotForm.value.acceptance_criteria_text),
-        tech_constraints: splitLines(slotForm.value.tech_constraints_text),
-        validation_commands: splitLines(slotForm.value.validation_commands_text),
-        reproduction_steps: splitLines(slotForm.value.reproduction_steps_text),
-      })
-      for (const key of Object.keys(payload)) {
-        if (key.endsWith('_text')) delete payload[key]
-      }
+      Object.assign(payload, selectedClarifications.value)
+      if (slotForm.value.intent_workflow_type) payload.intent_workflow_type = slotForm.value.intent_workflow_type
     }
     await fetch('/api/workflow/resume', {
       method: 'POST',
@@ -223,6 +268,8 @@ function goBack() {
 
 onMounted(() => {
   connectWebSocket()
+  restoreStatus()
+  restoreTraceEvents()
 })
 
 onUnmounted(() => {
@@ -237,7 +284,11 @@ watch(() => props.sessionId, () => {
   isError.value = false
   isPaused.value = false
   acceptance.value = defaultAcceptance()
+  selectedClarifications.value = {}
+  traceEvents.value = []
   connectWebSocket()
+  restoreStatus()
+  restoreTraceEvents()
 })
 </script>
 
@@ -283,6 +334,17 @@ watch(() => props.sessionId, () => {
       </div>
     </div>
 
+    <details v-if="traceEvents.length" class="live-trace" open>
+      <summary>实时 Trace（{{ traceEvents.length }}）</summary>
+      <div v-for="event in traceEvents" :key="event.id" class="live-trace-event">
+        <div class="live-trace-header">
+          <strong>{{ event.event_type }}</strong>
+          <span>{{ event.stage || '-' }} · {{ event.created_at || '-' }}</span>
+        </div>
+        <pre>{{ tracePayload(event) }}</pre>
+      </div>
+    </details>
+
     <div v-if="isPaused" class="pause-section">
       <div class="pause-message">
         <template v-if="pauseStage === 'human_accept'">
@@ -304,25 +366,27 @@ watch(() => props.sessionId, () => {
           </div>
         </template>
         <template v-else-if="pauseStage === 'intent_clarify'">
-          <p class="pause-title">请补充研发任务信息</p>
-          <p class="pause-hint">系统会基于你确认的槽位决定继续开发、进入调试或保持暂停。</p>
+          <p class="pause-title">请选择缺失信息</p>
+          <p class="pause-hint">系统已先从你的原始描述提取信息，下面只需要确认尚未明确的关键选项。</p>
           <div v-if="intentValidation" class="slot-warning">
-            <strong>待补充：</strong>{{ intentValidation.missing_slots?.join('、') || '流程选择确认' }}
-            <ul><li v-for="question in intentValidation.clarification_questions" :key="question">{{ question }}</li></ul>
+            <strong>待确认：</strong>{{ intentValidation.missing_slots?.join('、') || '流程选择确认' }}
           </div>
-          <div class="slot-form">
-            <label>确认流程<select v-model="slotForm.intent_workflow_type"><option value="">保持自动识别</option><option value="dev">DEV：需求开发</option><option value="debug">DEBUG：BUG 修复</option></select></label>
-            <label>目标模块 / 路径<textarea v-model="slotForm.target_modules_text" rows="2" placeholder="每行一个，例如 backend/api" /></label>
-            <label>允许修改范围<textarea v-model="slotForm.change_scope_text" rows="2" placeholder="每行一个相对路径，例如 backend" /></label>
-            <label>禁止修改范围<textarea v-model="slotForm.protected_paths_text" rows="2" placeholder="每行一个相对路径，例如 migrations" /></label>
-            <label>验收标准<textarea v-model="slotForm.acceptance_criteria_text" rows="2" placeholder="每行一个可验证标准" /></label>
-            <label>技术约束<textarea v-model="slotForm.tech_constraints_text" rows="2" placeholder="技术栈、兼容性、代码风格要求" /></label>
-            <label>验证命令<textarea v-model="slotForm.validation_commands_text" rows="2" placeholder="例如 pytest；仍会经过白名单校验" /></label>
-            <label>复现步骤 / 日志<textarea v-model="slotForm.reproduction_steps_text" rows="2" placeholder="DEBUG 任务必填；每行一个步骤或日志摘要" /></label>
-            <label>实际表现<textarea v-model="slotForm.observed_behavior" rows="2" placeholder="DEBUG 任务必填" /></label>
-            <label>预期表现<textarea v-model="slotForm.expected_behavior" rows="2" placeholder="可选" /></label>
+          <div class="choice-groups">
+            <div v-for="group in (intentValidation?.clarification_options || [])" :key="group.slot" class="choice-group">
+              <strong>{{ group.label }}</strong>
+              <div class="choice-list">
+                <button
+                  v-for="option in group.options"
+                  :key="option.label"
+                  type="button"
+                  class="choice-btn"
+                  :class="{ selected: JSON.stringify(selectedClarifications[group.slot]) === JSON.stringify(option.value) }"
+                  @click="chooseClarification({ ...option, slot: group.slot })"
+                >{{ option.label }}</button>
+              </div>
+            </div>
           </div>
-          <div class="pause-actions"><button class="btn-approve" @click="sendDecision('slots_provided')">确认并继续</button></div>
+          <div class="pause-actions"><button class="btn-approve" :disabled="!Object.keys(selectedClarifications).length" @click="sendDecision('slots_provided')">确认并继续</button></div>
         </template>
         <template v-else-if="pauseStage === 'human_intervene'">
           <p class="pause-title">自动修复已暂停</p>
@@ -363,6 +427,13 @@ watch(() => props.sessionId, () => {
 
 <style scoped>
 .progress-container { max-width: 600px; margin: 0 auto; }
+
+.live-trace { margin: 18px 0; border-top: 1px solid #30363d; padding-top: 10px; }
+.live-trace summary { cursor: pointer; color: #8b949e; font-size: 13px; }
+.live-trace-event { border-left: 2px solid #30363d; margin: 8px 0; padding: 7px 9px; }
+.live-trace-header { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
+.live-trace-header span { color: #8b949e; }
+.live-trace-event pre { white-space: pre-wrap; max-height: 140px; overflow: auto; color: #8b949e; font-size: 11px; margin-top: 5px; }
 
 .status-bar {
   display: flex;
@@ -483,6 +554,12 @@ watch(() => props.sessionId, () => {
 .acceptance-form textarea { resize:vertical; }
 @media (max-width: 560px) { .acceptance-form { grid-template-columns:1fr; } }
 .slot-warning { text-align:left; background:#211b10; border:1px solid #d29922; border-radius:6px; padding:10px; color:#d29922; font-size:13px; margin:12px 0; }.slot-warning ul { margin:6px 0 0 18px; color:#c9d1d9; }
+.choice-groups { display:flex; flex-direction:column; gap:14px; margin:14px 0; text-align:left; }
+.choice-group { display:flex; flex-direction:column; gap:7px; color:#c9d1d9; font-size:13px; }
+.choice-list { display:grid; grid-template-columns:repeat(auto-fit,minmax(180px,1fr)); gap:7px; }
+.choice-btn { background:#161b22; border:1px solid #30363d; border-radius:6px; color:#c9d1d9; cursor:pointer; padding:9px 10px; text-align:left; }
+.choice-btn:hover,.choice-btn.selected { border-color:#58a6ff; background:#13233a; }
+.btn-approve:disabled { opacity:.5; cursor:not-allowed; }
 .slot-form { display:grid; grid-template-columns:1fr 1fr; gap:9px; text-align:left; margin:12px 0; }.slot-form label { display:flex; flex-direction:column; gap:4px; color:#8b949e; font-size:12px; }.slot-form input,.slot-form textarea,.slot-form select { background:#161b22; border:1px solid #30363d; border-radius:6px; color:#c9d1d9; padding:7px; font:inherit; }.slot-form textarea { resize:vertical; } @media (max-width:560px) { .slot-form { grid-template-columns:1fr; } }
 
 .complete-section, .error-section {

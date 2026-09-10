@@ -6,7 +6,7 @@ import json
 import re
 from typing import Any
 
-from backend.budget import BudgetExceededError, TokenBudget
+from backend.budget import BudgetExceededError, get_workflow_budget
 from backend.graph.nodes import PLAN_MODE_TOOLS, build_node_messages, inject_rag_context, load_system_prompt, run_fc_loop
 
 
@@ -93,7 +93,8 @@ async def run_review_perspective(
         "报告开头必须标注 [审查通过] 或 [审查不通过]，并在末尾按 Prompt 输出审查判定数据 JSON。"
     )
 
-    budget = TokenBudget()
+    budget = get_workflow_budget()
+    tokens_before = budget.total_input_tokens + budget.total_output_tokens
     try:
         report = await run_fc_loop(
             build_node_messages(system_prompt, user_content),
@@ -108,15 +109,17 @@ async def run_review_perspective(
         report = _failed_review_report(perspective, f"审查执行失败: {exc}")
 
     result = parse_review_report(report, perspective)
+    tokens_after = budget.total_input_tokens + budget.total_output_tokens
+    tokens_used = tokens_after - tokens_before
     await record_event("review_finished", f"review_{perspective}", {
         "perspective": perspective,
         "review_round": review_round,
         "passed": result["passed"],
         "finding_count": len(result["findings"]),
         "parse_errors": result["parse_errors"],
-        "tokens": budget.total_input_tokens + budget.total_output_tokens,
+        "tokens": tokens_used,
     })
-    return {report_key: report, result_key: result, token_key: budget.total_input_tokens + budget.total_output_tokens}
+    return {report_key: report, result_key: result, token_key: tokens_used}
 
 
 def parse_review_report(report: str, perspective: str) -> dict[str, Any]:

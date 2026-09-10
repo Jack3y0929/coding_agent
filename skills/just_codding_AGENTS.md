@@ -34,6 +34,11 @@
    - Agent执行的任何shell命令必须匹配预定义白名单
    - 白名单仅包含编译/检查/读取类命令（如 `cargo check`、`npm run build`、`pytest`）
    - 不在白名单内的命令拒绝执行并记录日志
+   - `execute_shell` 会自动把当前任务的 `project_path` 作为工作目录（`cwd`），命令中禁止再次拼接 `cd`、`dir`、`ls`、`pwd`、`Set-Location` 或其他目录切换命令
+   - 禁止使用 `&&`、`||`、`;`、管道、重定向等 shell 组合语法；源码浏览必须使用 `read_file` / `search_code`
+   - 验证命令必须能从项目根目录直接执行。前端位于子目录时使用 `npm run build --prefix frontend`、`npm run lint --prefix frontend` 或 `npm run typecheck --prefix frontend`，不要使用项目根目录下的 `npm run build`
+   - Python 测试使用 `pytest` 或 `python -m pytest`；Git 检查使用白名单中的 `git status`、`git diff`、`git log --oneline`
+   - 需求文档中的 `validation_commands` 只能填写上述白名单命令及其安全参数；不要让模型自行生成 `cd /d ... && ...`、`ls -la ...` 等平台相关命令
 
 5. **写文件路径校验**
    - `write_file` 操作必须在项目源码目录内，禁止写入系统目录或非项目配置文件
@@ -158,6 +163,6 @@ just_codding/
 
 ---
 
-**最后更新**: 2026-05-14
+**最后更新**: 2026-09-07
 **文档作者**: 林栖(cat07)
 **文档版本**: 1.0

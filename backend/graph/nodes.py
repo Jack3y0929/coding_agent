@@ -9,6 +9,7 @@ import traceback
 from typing import Any
 
 from openai import AsyncOpenAI
+import httpx
 
 from backend.budget import BudgetExceededError, TokenBudget
 from backend.config import (
@@ -19,6 +20,8 @@ from backend.config import (
     MAX_TOOL_ROUNDS,
     API_TIMEOUT,
     PROJECT_ROOT,
+    TOOL_CONTEXT_MAX_CHARS,
+    TOOL_ROUND_MAX_CHARS,
 )
 from backend.db.models import Database
 from backend.tools.file_tools import read_file, write_file
@@ -37,11 +40,13 @@ FC_TOOLS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "读取源码文件内容。返回文件全文。",
+            "description": "按行读取源码文件；默认返回有限片段，需要更多内容时传入 start/end。",
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "文件路径（相对于项目根目录）"}
+                    "path": {"type": "string", "description": "文件路径（相对于项目根目录）"},
+                    "start": {"type": "integer", "minimum": 1, "description": "起始行号（可选，默认从第1行开始）"},
+                    "end": {"type": "integer", "minimum": 1, "description": "结束行号（可选，默认按工具上限返回）"},
                 },
                 "required": ["path"]
             }
@@ -165,7 +170,8 @@ async def call_deepseek(
     if not api_key:
         raise ValueError("DEEPSEEK_API_KEY 未设置")
 
-    client = AsyncOpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL)
+    # SDK 不再自行重试，由项目层统一控制重试次数、退避和 Trace。
+    client = AsyncOpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL, max_retries=0)
 
     # 预算检查
     input_tokens = 0
@@ -176,44 +182,44 @@ async def call_deepseek(
     for attempt in range(1, MAX_RETRIES + 1):
         started_at = __import__("time").perf_counter()
         try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                tools=tools,
-                timeout=API_TIMEOUT,
-            )
-
-            usage = response.usage
-            if budget and usage:
-                budget.after_call(
-                    usage.prompt_tokens or input_tokens,
-                    usage.completion_tokens or 0
+            if DEEPSEEK_BASE_URL.rstrip("/").endswith("/anthropic"):
+                result = await _call_anthropic_compatible(messages, tools, model, api_key)
+                response_content = result["content"]
+                response_tool_calls = result["tool_calls"]
+                usage_input = result["usage"]["prompt_tokens"]
+                usage_output = result["usage"]["completion_tokens"]
+            else:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    tools=tools,
+                    timeout=API_TIMEOUT,
                 )
+                msg = response.choices[0].message
+                response_content = msg.content or ""
+                response_tool_calls = [
+                    {"id": tc.id, "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                    for tc in msg.tool_calls
+                ] if msg.tool_calls else None
+                usage_input = response.usage.prompt_tokens if response.usage else input_tokens
+                usage_output = response.usage.completion_tokens if response.usage else 0
 
-            msg = response.choices[0].message
             from backend.trace import record_event
             await record_event("llm_call", None, {
                 "model": model,
                 "attempt": attempt,
-                "input_tokens": usage.prompt_tokens if usage else input_tokens,
-                "output_tokens": usage.completion_tokens if usage else 0,
-                "tool_call_count": len(msg.tool_calls or []),
+                "input_tokens": usage_input,
+                "output_tokens": usage_output,
+                "tool_call_count": len(response_tool_calls or []),
             }, int((__import__("time").perf_counter() - started_at) * 1000))
+            if budget:
+                budget.after_call(usage_input, usage_output)
             return {
-                "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "function": {
-                            "name": tc.function.name,
-                            "arguments": tc.function.arguments,
-                        }
-                    }
-                    for tc in msg.tool_calls
-                ] if msg.tool_calls else None,
+                "content": response_content,
+                "tool_calls": response_tool_calls,
                 "usage": {
-                    "prompt_tokens": usage.prompt_tokens if usage else 0,
-                    "completion_tokens": usage.completion_tokens if usage else 0,
+                    "prompt_tokens": usage_input,
+                    "completion_tokens": usage_output,
                 },
             }
 
@@ -232,6 +238,72 @@ async def call_deepseek(
     raise RuntimeError(f"API调用失败（已重试{MAX_RETRIES}次）: {last_error}")
 
 
+async def _call_anthropic_compatible(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    model: str,
+    api_key: str,
+) -> dict[str, Any]:
+    """调用 DeepSeek Anthropic 兼容协议并转换为内部 OpenAI 风格结果。"""
+    system_parts = [str(item.get("content", "")) for item in messages if item.get("role") == "system"]
+    converted: list[dict[str, Any]] = []
+    for item in messages:
+        role = item.get("role")
+        if role == "system":
+            continue
+        if role == "tool":
+            converted.append({"role": "user", "content": [{
+                "type": "tool_result", "tool_use_id": item.get("tool_call_id", ""),
+                "content": str(item.get("content", "")),
+            }]})
+            continue
+        content = item.get("content", "")
+        if role == "assistant" and item.get("tool_calls"):
+            blocks: list[dict[str, Any]] = []
+            if content:
+                blocks.append({"type": "text", "text": str(content)})
+            for call in item["tool_calls"]:
+                fn = call.get("function", {})
+                try:
+                    arguments = json.loads(fn.get("arguments", "{}"))
+                except json.JSONDecodeError:
+                    arguments = {}
+                blocks.append({"type": "tool_use", "id": call.get("id", ""),
+                               "name": fn.get("name", ""), "input": arguments})
+            content = blocks
+        converted.append({"role": "assistant" if role == "assistant" else "user", "content": content})
+
+    payload: dict[str, Any] = {
+        "model": model, "max_tokens": 4096, "messages": converted,
+    }
+    if system_parts:
+        payload["system"] = "\n\n".join(system_parts)
+    if tools:
+        payload["tools"] = [{
+            "name": tool["function"]["name"],
+            "description": tool["function"].get("description", ""),
+            "input_schema": tool["function"].get("parameters", {"type": "object"}),
+        } for tool in tools]
+
+    async with httpx.AsyncClient(timeout=API_TIMEOUT) as http:
+        response = await http.post(
+            f"{DEEPSEEK_BASE_URL.rstrip('/')}/v1/messages",
+            headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json=payload,
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    text_parts = [block.get("text", "") for block in data.get("content", []) if block.get("type") == "text"]
+    tool_calls = [{
+        "id": block.get("id", ""),
+        "function": {"name": block.get("name", ""), "arguments": json.dumps(block.get("input", {}), ensure_ascii=False)},
+    } for block in data.get("content", []) if block.get("type") == "tool_use"]
+    usage = data.get("usage", {})
+    return {"content": "\n".join(text_parts), "tool_calls": tool_calls or None,
+            "usage": {"prompt_tokens": usage.get("input_tokens", 0), "completion_tokens": usage.get("output_tokens", 0)}}
+
+
 # ---- FC 工具执行 ----
 
 async def execute_tool(
@@ -247,14 +319,14 @@ async def execute_tool(
     try:
         result: str
         if tool_name == "read_file":
-            target = os.path.join(project_path, arguments["path"]) if project_path else arguments["path"]
-            result = await read_file(target)
+            result = await read_file(arguments["path"], arguments.get("start"), arguments.get("end"), project_path=project_path or None)
 
         elif tool_name == "write_file":
-            target = os.path.join(project_path, arguments["path"]) if project_path else arguments["path"]
             from backend.intent.context import current_intent
             from backend.intent.rules import validate_write_scope
             intent = current_intent()
+            from backend.project_scope import project_file_path
+            target = project_file_path(project_path, arguments["path"]) if project_path else arguments["path"]
             scope_error = validate_write_scope(project_path, target, intent) if intent else None
             if scope_error:
                 result = f"错误：研发槽位范围校验未通过：{scope_error}"
@@ -263,13 +335,14 @@ async def execute_tool(
                     "path": arguments["path"], "reason": scope_error,
                 })
             else:
-                result = await write_file(target, arguments["content"])
+                result = await write_file(target, arguments["content"], project_path=project_path or None)
 
         elif tool_name == "search_code":
             result = await search_code(
                 arguments["pattern"],
                 arguments.get("file_pattern"),
                 directory=project_path,
+                project_path=project_path or None,
             )
 
         elif tool_name == "execute_shell":
@@ -325,7 +398,9 @@ async def run_fc_loop(
     运行 FC 工具循环：发送消息 → 检查 tool_calls → 执行工具 → 继续。
     返回最终的文本内容。
     """
-    current_messages = list(messages)  # 拷贝，不修改原始
+    base_messages = list(messages)  # 节点独立上下文，不修改调用方消息
+    current_messages = base_messages
+    last_tool_summary = ""
     max_rounds = MAX_TOOL_ROUNDS
 
     for _ in range(max_rounds):
@@ -334,22 +409,10 @@ async def run_fc_loop(
         if not result.get("tool_calls"):
             return result["content"]
 
-        # 追加 assistant 消息（含 tool_calls）
-        current_messages.append({
-            "role": "assistant",
-            "content": result["content"],
-            "tool_calls": [
-                {
-                    "id": tc["id"],
-                    "type": "function",
-                    "function": {
-                        "name": tc["function"]["name"],
-                        "arguments": tc["function"]["arguments"],
-                    }
-                }
-                for tc in result["tool_calls"]
-            ]
-        })
+        # 轮次结束后只保留短摘要，避免历史工具原文累积到下一次请求。
+        tool_summaries: list[str] = []
+        if result.get("content"):
+            tool_summaries.append(f"模型本轮说明：\n{str(result['content'])[:TOOL_CONTEXT_MAX_CHARS]}")
 
         # 执行每个工具调用
         for tc in result["tool_calls"]:
@@ -360,13 +423,29 @@ async def run_fc_loop(
                 func_args = {}
 
             tool_result = await execute_tool(func_name, func_args, mode, project_path)
-            current_messages.append({
-                "role": "tool",
-                "tool_call_id": tc["id"],
-                "content": tool_result,
-            })
+            bounded_result = tool_result[:TOOL_CONTEXT_MAX_CHARS]
+            if len(tool_result) > TOOL_CONTEXT_MAX_CHARS:
+                bounded_result += "\n...（工具结果已截断，必要时请缩小读取范围）"
+            tool_summaries.append(f"工具 {func_name} 返回：\n{bounded_result}")
 
-    return current_messages[-1].get("content", "") if current_messages else ""
+        last_tool_summary = "\n\n".join(tool_summaries)
+        if len(last_tool_summary) > TOOL_ROUND_MAX_CHARS:
+            last_tool_summary = (
+                last_tool_summary[:TOOL_ROUND_MAX_CHARS]
+                + "\n...（本轮工具摘要已截断，请拆分工具调用或缩小读取范围）"
+            )
+        current_messages = [
+            *base_messages,
+            {
+                "role": "user",
+                "content": (
+                    "上一轮工具执行摘要（仅保留本轮结果，历史工具原文已丢弃）：\n"
+                    + last_tool_summary
+                ),
+            },
+        ]
+
+    return last_tool_summary or (current_messages[-1].get("content", "") if current_messages else "")
 
 
 # ---- 节点间消息构建 ----
@@ -415,7 +494,7 @@ async def inject_rag_context(role: str, query: str, project_path: str = "") -> s
     """为指定角色注入 RAG 检索上下文"""
     from backend.rag.retriever import hybrid_retrieve_for_role
     try:
-        rag_context = await hybrid_retrieve_for_role(query, role)
+        rag_context = await hybrid_retrieve_for_role(query, role, project_path=project_path or None)
         from backend.trace import get_active_preferences
         preferences = await get_active_preferences(project_path) if project_path else []
         if not preferences:

@@ -75,13 +75,33 @@ async def record_event(
     resolved_trace_id = trace_id or current_trace_id()
     if not resolved_trace_id:
         return
+    session_id: Optional[str] = None
+    event_id: Optional[int] = None
     async with Database() as db:
-        await db._conn.execute(
+        trace_row = await (await db._conn.execute(
+            "SELECT session_id FROM workflow_traces WHERE trace_id = ?", (resolved_trace_id,)
+        )).fetchone()
+        if trace_row:
+            session_id = str(trace_row["session_id"])
+        created_at = _now()
+        cursor = await db._conn.execute(
             "INSERT INTO trace_events (trace_id, event_type, stage, payload, duration_ms, created_at) "
             "VALUES (?, ?, ?, ?, ?, ?)",
-            (resolved_trace_id, event_type, stage, _json(payload or {}), duration_ms, _now()),
+            (resolved_trace_id, event_type, stage, _json(payload or {}), duration_ms, created_at),
         )
+        event_id = cursor.lastrowid
         await db._conn.commit()
+    if session_id:
+        from backend.graph.context import push_trace_event
+        await push_trace_event(session_id, {
+            "id": event_id,
+            "trace_id": resolved_trace_id,
+            "event_type": event_type,
+            "stage": stage,
+            "payload": payload or {},
+            "duration_ms": duration_ms,
+            "created_at": created_at,
+        })
 
 
 async def finish_trace(
@@ -233,6 +253,16 @@ async def get_trace(trace_id: str) -> Optional[dict[str, Any]]:
     } for row in evaluations]
     item["artifacts"] = [dict(row) for row in artifacts]
     return item
+
+
+async def get_trace_by_session(session_id: str) -> Optional[dict[str, Any]]:
+    """按会话获取最近一次 Trace，供工作流状态 API 使用。"""
+    async with Database() as db:
+        row = await (await db._conn.execute(
+            "SELECT trace_id FROM workflow_traces WHERE session_id = "
+            "? ORDER BY started_at DESC LIMIT 1", (session_id,)
+        )).fetchone()
+    return await get_trace(row["trace_id"]) if row else None
 
 
 async def add_trace_label(trace_id: str, label: dict[str, Any]) -> dict[str, Any]:

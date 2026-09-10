@@ -8,7 +8,7 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from backend.budget import BudgetExceededError, TokenBudget
+from backend.budget import BudgetExceededError, get_workflow_budget
 from backend.config import MAX_FIX_ATTEMPTS, PROJECT_ROOT
 from backend.db.models import Database
 from backend.graph.context import push_progress, wait_for_human
@@ -111,12 +111,12 @@ async def node_analyze(state: DevWorkflowState) -> dict[str, Any]:
         f"## 澄清文档\n{state['clarification_doc']}\n\n"
         f"## 项目路径\n{state['project_path']}\n\n"
         f"{rag_ctx}\n\n"
-        f"请根据以上信息，输出需求概括文档。按照你定义的四阶段流程进行分析后，"
-        f"输出包含项目定义、核心功能范围、技术栈约束、关键成功标准、风险清单的结构化文档。"
+        f"请直接根据已确认槽位输出一份简短、可执行的需求概括文档。"
+        f"不要重复提问或展开需求访谈，只保留项目定义、功能范围、约束、验收标准和风险。"
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         result = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
@@ -128,8 +128,7 @@ async def node_analyze(state: DevWorkflowState) -> dict[str, Any]:
         await db.add_artifact(sid, "requirement", result)
 
     logger.info(f"[{sid}] 需求概括文档已生成 ({len(result)} 字符)")
-    return {"requirement_doc": result, "token_used": state.get("token_used", 0) +
-            budget.total_input_tokens + budget.total_output_tokens}
+    return {"requirement_doc": result, "token_used": budget.total_input_tokens + budget.total_output_tokens}
 
 
 async def node_develop_plan(state: DevWorkflowState) -> dict[str, Any]:
@@ -155,7 +154,7 @@ async def node_develop_plan(state: DevWorkflowState) -> dict[str, Any]:
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         plan = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
@@ -168,8 +167,7 @@ async def node_develop_plan(state: DevWorkflowState) -> dict[str, Any]:
 
     logger.info(f"[{sid}] 开发方案已生成 ({len(plan)} 字符)")
     return {"plan": plan, "stage": "develop_build",
-            "token_used": state.get("token_used", 0) +
-            budget.total_input_tokens + budget.total_output_tokens}
+            "token_used": budget.total_input_tokens + budget.total_output_tokens}
 
 
 async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
@@ -193,7 +191,7 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
@@ -212,8 +210,7 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
     return {
         "code_changes": code_changes,
         "implementation_note": impl_note,
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
+        "token_used": budget.total_input_tokens + budget.total_output_tokens,
     }
 
 
@@ -248,7 +245,10 @@ async def node_review_aggregate(state: DevWorkflowState) -> dict[str, Any]:
     aggregate = aggregate_review_reports(state, "dev", required_rounds=1)
     review_round = aggregate["review_round"]
     review_passed = aggregate["review_passed"]
-    aggregate["token_used"] = state.get("token_used", 0) + aggregate["review_aggregate_tokens"]
+    aggregate["token_used"] = sum(
+        int(state.get(key, 0) or 0)
+        for key in ("review_logic_tokens", "review_security_tokens", "review_quality_tokens")
+    ) + state.get("token_used", 0)
 
     async with Database() as db:
         await db.add_artifact(sid, "review", aggregate["review_report"])
@@ -316,7 +316,7 @@ async def node_fix(state: DevWorkflowState) -> dict[str, Any]:
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
@@ -331,8 +331,7 @@ async def node_fix(state: DevWorkflowState) -> dict[str, Any]:
         "code_changes": code_changes,
         "implementation_note": impl_note,
         "fix_attempt": fix_attempt,
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
+        "token_used": budget.total_input_tokens + budget.total_output_tokens,
     }
 
 
@@ -412,6 +411,7 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
             title=f"DEV任务 - {state.get('description', '')[:50]}",
             content=summary,
             source_session_id=sid,
+            project_path=state.get("project_path", ""),
         )
 
         # 增量更新RAG索引
@@ -421,7 +421,7 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
                 for fp in code_changes.keys()
             ]
             try:
-                await indexer.incremental_update(changed_files)
+                await indexer.incremental_update(changed_files, project_path=state.get("project_path", ""))
             except Exception as exc:
                 logger.warning(f"增量RAG更新失败: {exc}")
 

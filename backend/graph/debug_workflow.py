@@ -9,7 +9,7 @@ from typing import Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
 
-from backend.budget import BudgetExceededError, TokenBudget
+from backend.budget import BudgetExceededError, get_workflow_budget
 from backend.config import MAX_FIX_ATTEMPTS, REVIEW_ROUNDS_DEBUG
 from backend.db.models import Database
 from backend.graph.context import push_progress, wait_for_human
@@ -126,7 +126,7 @@ async def node_diagnose(state: DebugWorkflowState) -> dict[str, Any]:
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         result = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
@@ -154,8 +154,7 @@ async def node_diagnose(state: DebugWorkflowState) -> dict[str, Any]:
         "diagnosis_report": result,
         "diagnosis_sufficient": diagnosis_sufficient,
         "diagnosis_evidence": diagnosis_evidence,
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
+        "token_used": budget.total_input_tokens + budget.total_output_tokens,
     }
 
 
@@ -178,7 +177,7 @@ async def node_add_logging(state: DebugWorkflowState) -> dict[str, Any]:
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
@@ -188,8 +187,7 @@ async def node_add_logging(state: DebugWorkflowState) -> dict[str, Any]:
 
     logger.info(f"[{sid}] 日志打点已添加")
     return {
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
+        "token_used": budget.total_input_tokens + budget.total_output_tokens,
     }
 
 
@@ -236,7 +234,7 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
     )
 
     messages = build_node_messages(system_prompt, user_content)
-    budget = TokenBudget()
+    budget = get_workflow_budget()
 
     try:
         result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
@@ -255,8 +253,7 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
         "code_changes": code_changes,
         "implementation_note": impl_note,
         "fix_attempt": fix_attempt,
-        "token_used": state.get("token_used", 0) +
-        budget.total_input_tokens + budget.total_output_tokens,
+        "token_used": budget.total_input_tokens + budget.total_output_tokens,
     }
 
 
@@ -291,7 +288,10 @@ async def node_review_aggregate(state: DebugWorkflowState) -> dict[str, Any]:
     aggregate = aggregate_review_reports(state, "debug", required_rounds=REVIEW_ROUNDS_DEBUG)
     review_round = aggregate["review_round"]
     review_passed = aggregate["review_passed"]
-    aggregate["token_used"] = state.get("token_used", 0) + aggregate["review_aggregate_tokens"]
+    aggregate["token_used"] = sum(
+        int(state.get(key, 0) or 0)
+        for key in ("review_logic_tokens", "review_security_tokens", "review_quality_tokens")
+    ) + state.get("token_used", 0)
 
     async with Database() as db:
         await db.add_artifact(sid, "review", aggregate["review_report"])
@@ -414,6 +414,7 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
             title=f"BUG修复 - {state.get('description', '')[:50]}",
             content=f"{state.get('diagnosis_report', '')}\n\n{summary}",
             source_session_id=sid,
+            project_path=state.get("project_path", ""),
         )
 
         if code_changes:
@@ -422,7 +423,7 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
                 for fp in code_changes.keys()
             ]
             try:
-                await indexer.incremental_update(changed_files)
+                await indexer.incremental_update(changed_files, project_path=state.get("project_path", ""))
             except Exception as exc:
                 logger.warning(f"增量RAG更新失败: {exc}")
 
