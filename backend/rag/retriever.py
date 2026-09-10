@@ -134,7 +134,34 @@ async def hybrid_retrieve_for_role(
     else:
         results = await hybrid_retrieve(query, top_k=top_k, project_path=project_path, db_path=db_path)
 
+    await _trace_retrieval(role, query, results, project_path)
     return _format_rag_context(results)
+
+
+async def _trace_retrieval(role: str, query: str, results: list[dict[str, Any]],
+                           project_path: str | None) -> None:
+    """记录每次角色检索的查询词与命中结果，便于人工和 AI 审计。"""
+    try:
+        from backend.trace import record_event
+        payload = {
+            "role": role,
+            "project_path": project_path or "",
+            "query": query[:500],
+            "hit_count": len(results),
+            "hits": [
+                {
+                    "id": item.get("id"),
+                    "source_type": item.get("source_type"),
+                    "source_path": item.get("source_path"),
+                    "symbol": item.get("symbol"),
+                    "chunk_index": item.get("chunk_index", 0),
+                }
+                for item in results
+            ],
+        }
+        await record_event("rag_retrieval", "rag", payload)
+    except Exception:
+        logger.debug("RAG 命中 Trace 记录失败", exc_info=True)
 
 
 def _format_rag_context(results: list[dict[str, Any]]) -> str:

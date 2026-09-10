@@ -1,5 +1,6 @@
 <script setup>
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
+import TraceEventList from './TraceEventList.vue'
 
 const traces = ref([])
 const selected = ref(null)
@@ -56,7 +57,11 @@ async function saveLabel() {
   } catch (e) { error.value = e.message }
 }
 
-function eventPayload(event) { return JSON.stringify(event.payload, null, 2) }
+const durationText = computed(() => {
+  if (selected.value?.duration_ms == null) return '-'
+  if (selected.value.duration_ms < 1000) return `${selected.value.duration_ms}ms`
+  return `${(selected.value.duration_ms / 1000).toFixed(1)}s`
+})
 onMounted(loadTraces)
 </script>
 
@@ -80,9 +85,15 @@ onMounted(loadTraces)
       <div v-if="selected" class="detail">
         <h3>{{ selected.trace_id }}</h3>
         <p>{{ selected.project_path || '未设置项目路径' }}</p>
-        <div class="stats"><span>时长 {{ selected.duration_ms ?? '-' }} ms</span><span>输入 {{ selected.input_tokens }}</span><span>输出 {{ selected.output_tokens }}</span></div>
-        <details open><summary>执行时间线（{{ selected.events.length }}）</summary><div v-for="event in selected.events" :key="event.id" class="event"><b>{{ event.event_type }}</b><span>{{ event.stage || '-' }} · {{ event.duration_ms ?? '-' }} ms</span><pre>{{ eventPayload(event) }}</pre></div></details>
-        <details v-if="selected.evaluations?.length" open><summary>单任务质量评测（{{ selected.evaluations.length }}）</summary><div v-for="item in selected.evaluations" :key="item.metric_name" class="event"><b>{{ item.metric_name }}：{{ item.score ?? '-' }}</b><span>{{ item.source }}</span><pre>{{ JSON.stringify(item.evidence, null, 2) }}</pre></div></details>
+        <div class="summary-grid">
+          <article><small>状态</small><strong :class="`status-${selected.status}`">{{ selected.status }}</strong></article>
+          <article><small>耗时</small><strong>{{ durationText }}</strong></article>
+          <article><small>输入Token</small><strong>{{ selected.input_tokens ?? 0 }}</strong></article>
+          <article><small>输出Token</small><strong>{{ selected.output_tokens ?? 0 }}</strong></article>
+          <article><small>Trace事件</small><strong>{{ selected.events?.length ?? 0 }}</strong></article>
+        </div>
+        <TraceEventList :events="selected.events || []" title="执行时间线" id-prefix="history" />
+        <details v-if="selected.evaluations?.length"><summary>单任务质量评测（{{ selected.evaluations.length }}）</summary><div v-for="item in selected.evaluations" :key="item.metric_name" class="event"><b>{{ item.metric_name }}：{{ item.score ?? '-' }}</b><span>{{ item.source }}</span><pre>{{ JSON.stringify(item.evidence, null, 2) }}</pre></div></details>
         <details><summary>正式产出物（{{ selected.artifacts.length }}）</summary><div v-for="artifact in selected.artifacts" :key="artifact.created_at + artifact.type" class="artifact"><b>{{ artifact.type }}</b><pre>{{ artifact.content }}</pre></div></details>
         <form class="label-form" @submit.prevent="saveLabel">
           <h3>人工标注与验收反馈</h3>
@@ -107,5 +118,5 @@ onMounted(loadTraces)
 </template>
 
 <style scoped>
-.toolbar,.stats,.grid { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.toolbar { margin-bottom:16px; }.toolbar h2 { margin-right:auto; }.toolbar select,.toolbar button,input,textarea { background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px; }.toolbar button,.primary { cursor:pointer; }.layout{display:grid;grid-template-columns:minmax(220px, .7fr) minmax(0,1.5fr);gap:16px}.trace-list,.detail{min-width:0}.trace-row{display:flex;width:100%;flex-direction:column;gap:4px;text-align:left;padding:10px;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;margin-bottom:7px;cursor:pointer}.trace-row.selected{border-color:#58a6ff}.trace-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.trace-row small,.detail>p,.event span{color:#8b949e;font-size:12px}.stats{margin:12px 0;color:#8b949e;font-size:13px}.detail details{border-top:1px solid #30363d;padding:10px 0}.event,.artifact{border-left:2px solid #30363d;padding:8px;margin:8px 0}.event pre,.artifact pre{white-space:pre-wrap;max-height:220px;overflow:auto;font-size:12px;color:#8b949e;margin-top:6px}.label-form{border-top:1px solid #30363d;margin-top:16px;padding-top:16px;display:flex;flex-direction:column;gap:10px}.label-form label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#8b949e}.grid>label{flex:1;min-width:140px}.primary{align-self:flex-start;background:#238636;border:0;border-radius:6px;color:white;padding:9px 16px}.error{color:#f85149}.empty{color:#8b949e;padding:24px;text-align:center;background:#161b22;border-radius:6px}@media(max-width:720px){.layout{grid-template-columns:1fr}}
+.toolbar,.grid { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.toolbar { margin-bottom:16px; }.toolbar h2 { margin-right:auto; }.toolbar select,.toolbar button,input,textarea { background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px; }.toolbar button,.primary { cursor:pointer; }.layout{display:grid;grid-template-columns:minmax(220px, .7fr) minmax(0,1.5fr);gap:16px}.trace-list,.detail{min-width:0}.trace-row{display:flex;width:100%;flex-direction:column;gap:4px;text-align:left;padding:10px;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;margin-bottom:7px;cursor:pointer}.trace-row.selected{border-color:#58a6ff}.trace-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.trace-row small,.detail>p,.event span{color:#8b949e;font-size:12px}.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:12px 0}.summary-grid article{background:#111418;border:1px solid #30363d;border-radius:7px;padding:9px}.summary-grid small{display:block;color:#8b949e;font-size:11px;margin-bottom:4px}.summary-grid strong{font-size:14px}.status-running{color:#58a6ff}.status-done{color:#3fb950}.status-failed{color:#f85149}.status-paused{color:#d29922}.detail details{border-top:1px solid #30363d;padding:10px 0}.event,.artifact{border-left:2px solid #30363d;padding:8px;margin:8px 0}.event pre,.artifact pre{white-space:pre-wrap;max-height:220px;overflow:auto;font-size:12px;color:#8b949e;margin-top:6px}.label-form{border-top:1px solid #30363d;margin-top:16px;padding-top:16px;display:flex;flex-direction:column;gap:10px}.label-form label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#8b949e}.grid>label{flex:1;min-width:140px}.primary{align-self:flex-start;background:#238636;border:0;border-radius:6px;color:white;padding:9px 16px}.error{color:#f85149}.empty{color:#8b949e;padding:24px;text-align:center;background:#161b22;border-radius:6px}@media(max-width:720px){.layout{grid-template-columns:1fr}}
 </style>

@@ -189,6 +189,36 @@ async def get_traces(
     return await list_traces(limit, workflow_type, project_path, status)
 
 
+@app.get("/api/rag/sources")
+async def get_rag_sources(
+    source_type: str | None = None,
+    project_path: str | None = None,
+    limit: int = 200,
+    offset: int = 0,
+) -> list[dict[str, Any]]:
+    """查看 RAG 已索引的来源清单。"""
+    from backend.db.models import Database, init_db
+    await init_db()
+    if limit < 1 or limit > 1000 or offset < 0:
+        return []
+    async with Database() as db:
+        return await db.list_rag_sources(source_type, project_path, limit, offset)
+
+
+@app.get("/api/rag/chunks")
+async def get_rag_chunks(
+    source_path: str,
+    source_type: str | None = None,
+    project_path: str | None = None,
+    include_embedding: bool = False,
+) -> list[dict[str, Any]]:
+    """查看指定来源的 RAG 分块、元数据与内容。"""
+    from backend.db.models import Database, init_db
+    await init_db()
+    async with Database() as db:
+        return await db.get_rag_chunks(source_path, source_type, project_path, include_embedding)
+
+
 @app.get("/api/traces/{trace_id}")
 async def get_trace_detail(trace_id: str) -> dict[str, Any]:
     """查询 Trace 时间线、产物与人工标注。"""

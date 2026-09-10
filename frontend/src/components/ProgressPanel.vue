@@ -1,5 +1,7 @@
 <script setup>
 import { ref, onMounted, onUnmounted, watch, computed } from 'vue'
+import StageStepper from './StageStepper.vue'
+import TraceEventList from './TraceEventList.vue'
 
 const props = defineProps({
   sessionId: String,
@@ -69,22 +71,7 @@ const costPercent = computed(() => {
   return tokenStatus.value.usage_percent || 0
 })
 
-const stageList = [
-  { key: 'init', name: '初始化' },
-  { key: 'input_gate', name: '需求澄清' },
-  { key: 'analyze', name: '需求分析' },
-  { key: 'develop_plan', name: '开发规划' },
-  { key: 'develop_build', name: '开发编码' },
-  { key: 'review', name: '代码审查' },
-  { key: 'fix', name: '修复问题' },
-  { key: 'human_accept', name: '人工验收' },
-  { key: 'output', name: '生成总结' },
-  { key: 'diagnose', name: 'BUG诊断' },
-  { key: 'add_logging', name: '添加日志' },
-  { key: 'validate', name: '验证变更' },
-  { key: 'human_wait', name: '等待复现' },
-  { key: 'human_intervene', name: '人工介入' },
-]
+const currentWorkflowType = ref(props.workflowType || 'dev')
 
 function connectWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
@@ -186,6 +173,30 @@ function handleProgress(data) {
     isPaused.value = false
     emit('finished')
   }
+
+  if (data.event === 'trace' && data.trace?.stage) {
+    normalizeStageFromTrace(data.trace)
+  }
+}
+
+function normalizeStageFromTrace(trace) {
+  if (!trace.stage) return
+  if (trace.stage?.startsWith('review_')) {
+    currentStage.value = 'review'
+    markStageSeen('review')
+    return
+  }
+  const knownStages = ['input_gate', 'analyze', 'develop_plan', 'develop_build', 'validate', 'review', 'fix', 'human_accept', 'output', 'diagnose', 'add_logging', 'human_wait']
+  if (knownStages.includes(trace.stage)) {
+    currentStage.value = trace.stage
+    markStageSeen(trace.stage)
+  }
+}
+
+function markStageSeen(stageKey) {
+  if (!stages.value.some(stage => stage.key === stageKey)) {
+    stages.value.push({ key: stageKey, name: stageKey, done: false, active: true })
+  }
 }
 
 function mergeTraceEvents(events) {
@@ -202,13 +213,23 @@ async function restoreTraceEvents() {
     const response = await fetch(`/api/workflow/events/${encodeURIComponent(props.sessionId)}`)
     const data = await response.json()
     if (!data.error) mergeTraceEvents(data.events || [])
+    const progressEvents = [...(data.events || [])]
+      .filter(event => event.event_type === 'progress')
+      .sort((a, b) => (a.id || 0) - (b.id || 0))
+    const latest = progressEvents.at(-1)
+    if (latest?.stage) {
+      currentStage.value = latest.stage
+      markStageSeen(latest.stage)
+    }
+    if (latest?.payload?.message) currentMessage.value = latest.payload.message
+    const failedEvent = (data.events || []).find(event => event.event_type === 'workflow_failed')
+    if (failedEvent) {
+      isError.value = true
+      errorMessage.value = failedEvent.payload?.error || '工作流执行失败'
+    }
   } catch (error) {
     console.warn('恢复 Trace 事件失败:', error)
   }
-}
-
-function tracePayload(event) {
-  return JSON.stringify(event.payload || {}, null, 2)
 }
 
 function chooseClarification(option) {
@@ -230,10 +251,15 @@ async function restoreStatus() {
     if (progress.stage || progress.event) handleProgress(progress)
     if (data.status === 'done') handleProgress({ event: 'complete', stage: 'output' })
     if (data.status === 'failed') handleProgress({ event: 'error', message: '工作流执行失败' })
+    if (data.type) currentWorkflowType.value = data.type
   } catch (error) {
     console.warn('恢复工作流状态失败:', error)
   }
 }
+
+watch(() => props.workflowType, value => {
+  if (value) currentWorkflowType.value = value
+})
 
 async function sendDecision(decision) {
   try {
@@ -318,32 +344,17 @@ watch(() => props.sessionId, () => {
       </div>
     </div>
 
-    <div class="stage-list">
-      <div
-        v-for="stage in stageList"
-        :key="stage.key"
-        class="stage-item"
-        :class="{
-          active: currentStage === stage.key,
-          done: stages.find(s => s.key === stage.key)?.done,
-        }"
-      >
-        <span class="stage-dot" :class="{ filled: stages.find(s => s.key === stage.key) }"></span>
-        <span class="stage-name">{{ stage.name }}</span>
-        <span class="stage-check" v-if="stages.find(s => s.key === stage.key)?.done">&#10003;</span>
-      </div>
-    </div>
+    <StageStepper
+      :workflow-type="currentWorkflowType"
+      :stages="stages"
+      :current-stage="currentStage"
+      :current-message="currentMessage"
+      :complete="isComplete"
+      :failed="isError"
+      :paused="isPaused"
+    />
 
-    <details v-if="traceEvents.length" class="live-trace" open>
-      <summary>实时 Trace（{{ traceEvents.length }}）</summary>
-      <div v-for="event in traceEvents" :key="event.id" class="live-trace-event">
-        <div class="live-trace-header">
-          <strong>{{ event.event_type }}</strong>
-          <span>{{ event.stage || '-' }} · {{ event.created_at || '-' }}</span>
-        </div>
-        <pre>{{ tracePayload(event) }}</pre>
-      </div>
-    </details>
+    <TraceEventList v-if="traceEvents.length" :events="traceEvents" title="实时 Trace" id-prefix="live" />
 
     <div v-if="isPaused" class="pause-section">
       <div class="pause-message">
@@ -428,12 +439,6 @@ watch(() => props.sessionId, () => {
 <style scoped>
 .progress-container { max-width: 600px; margin: 0 auto; }
 
-.live-trace { margin: 18px 0; border-top: 1px solid #30363d; padding-top: 10px; }
-.live-trace summary { cursor: pointer; color: #8b949e; font-size: 13px; }
-.live-trace-event { border-left: 2px solid #30363d; margin: 8px 0; padding: 7px 9px; }
-.live-trace-header { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; }
-.live-trace-header span { color: #8b949e; }
-.live-trace-event pre { white-space: pre-wrap; max-height: 140px; overflow: auto; color: #8b949e; font-size: 11px; margin-top: 5px; }
 
 .status-bar {
   display: flex;
@@ -475,34 +480,6 @@ watch(() => props.sessionId, () => {
   transition: width 0.5s;
 }
 
-.stage-list {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-  margin-bottom: 20px;
-}
-.stage-item {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  border-radius: 6px;
-  font-size: 13px;
-  color: #484f58;
-}
-.stage-item.active { color: #c9d1d9; background: #13233a; }
-.stage-item.done { color: #3fb950; }
-.stage-dot {
-  width: 8px;
-  height: 8px;
-  border-radius: 50%;
-  border: 2px solid #30363d;
-  flex-shrink: 0;
-}
-.stage-dot.filled { background: #58a6ff; border-color: #58a6ff; }
-.stage-item.done .stage-dot { background: #3fb950; border-color: #3fb950; }
-.stage-name { flex: 1; }
-.stage-check { font-size: 12px; }
 
 .pause-section {
   background: #1a1f24;

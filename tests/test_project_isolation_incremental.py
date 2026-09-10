@@ -64,5 +64,11 @@ def test_projects_are_isolated_and_incremental(tmp_path) -> None:
         async with Database(db_path) as db:
             rows = await db.get_rag_by_source("same.py", str(project_a.resolve()))
             assert rows and rows[0]["project_path"] == str(project_a.resolve())
+            sources = await db.list_rag_sources("file", str(project_a.resolve()))
+            assert any(item["source_path"] == "same.py" and item["chunk_count"] == 1 for item in sources)
+            chunks = await db.get_rag_chunks("same.py", "file", str(project_a.resolve()))
+            assert len(chunks) == 1
+            assert "changed-a" in chunks[0]["content"]
+            assert chunks[0]["embedding"] is None
 
     asyncio.run(scenario())

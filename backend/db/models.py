@@ -430,6 +430,57 @@ class Database:
         rows = await cursor.fetchall()
         return [dict(r) for r in rows]
 
+    async def list_rag_sources(self,
+                               source_type: Optional[str] = None,
+                               project_path: Optional[str] = None,
+                               limit: int = 200,
+                               offset: int = 0) -> list[dict[str, Any]]:
+        """列出 RAG 已索引来源，不含内容和向量，供人工/AI 审计。"""
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(source_type)
+        if project_path is not None:
+            clauses.append("project_path = ?")
+            params.append(project_path)
+        condition = " WHERE " + " AND ".join(clauses) if clauses else ""
+        sql = (
+            f"SELECT source_type, source_path, project_path, file_hash, mtime, size, "
+            f"COUNT(*) AS chunk_count, COUNT(DISTINCT symbol) AS symbol_count, "
+            f"SUM(token_count) AS token_count, MIN(created_at) AS created_at, "
+            f"MAX(updated_at) AS updated_at FROM rag_embeddings{condition} "
+            f"GROUP BY source_type, source_path, project_path, file_hash, mtime, size "
+            f"ORDER BY updated_at DESC, source_path LIMIT ? OFFSET ?"
+        )
+        params.extend([limit, offset])
+        cursor = await self._conn.execute(sql, tuple(params))
+        return [dict(row) for row in await cursor.fetchall()]
+
+    async def get_rag_chunks(self,
+                             source_path: str,
+                             source_type: Optional[str] = None,
+                             project_path: Optional[str] = None,
+                             include_embedding: bool = False) -> list[dict[str, Any]]:
+        """查看指定来源的 RAG 分块中间产物。"""
+        clauses = ["source_path = ?"]
+        params: list[Any] = [source_path]
+        if source_type:
+            clauses.append("source_type = ?")
+            params.append(source_type)
+        if project_path is not None:
+            clauses.append("project_path = ?")
+            params.append(project_path)
+        cursor = await self._conn.execute(
+            f"SELECT * FROM rag_embeddings WHERE {' AND '.join(clauses)} ORDER BY chunk_index, id",
+            tuple(params),
+        )
+        rows = [dict(row) for row in await cursor.fetchall()]
+        if not include_embedding:
+            for row in rows:
+                row["embedding"] = None
+        return rows
+
     async def get_rag_by_source(self, source_path: str, project_path: Optional[str] = None) -> list[dict[str, Any]]:
         params: tuple[Any, ...] = (source_path,) if project_path is None else (source_path, project_path)
         condition = "source_path = ?" + (" AND project_path = ?" if project_path is not None else "")
