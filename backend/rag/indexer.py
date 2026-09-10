@@ -314,7 +314,7 @@ class CodeIndexer:
         """将任务总结/错误模式写入长期记忆并向量化"""
         embedding_bytes = self._engine.encode_to_bytes(content)
 
-        async with Database() as db:
+        async with Database(self._db_path) as db:
             memory_id = await db.insert_long_term_memory(
                 category=category,
                 title=title,
@@ -338,3 +338,25 @@ class CodeIndexer:
 
         logger.info(f"长期记忆写入: [{category}] {title}")
         return memory_id
+
+    async def index_long_term_memory_entries(
+        self,
+        entries: list[dict[str, Any]],
+        source_session_id: str = "",
+        project_path: str = "",
+    ) -> list[int]:
+        """批量写入非空长期记忆；空内容自动跳过，避免污染 RAG。"""
+        memory_ids: list[int] = []
+        for entry in entries:
+            content = (entry.get("content") or "").strip()
+            if not content:
+                continue
+            memory_id = await self.index_long_term_memory(
+                category=entry["category"],
+                title=entry["title"],
+                content=content,
+                source_session_id=source_session_id,
+                project_path=project_path,
+            )
+            memory_ids.append(memory_id)
+        return memory_ids

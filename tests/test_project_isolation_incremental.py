@@ -16,6 +16,10 @@ class CountingEmbedding:
         self.calls += len(texts)
         return [np.zeros(384, dtype=np.float32).tobytes() for _ in texts]
 
+    def encode_to_bytes(self, text: str) -> bytes:
+        self.calls += 1
+        return np.zeros(384, dtype=np.float32).tobytes()
+
 
 def test_projects_are_isolated_and_incremental(tmp_path) -> None:
     async def scenario() -> None:
@@ -27,6 +31,8 @@ def test_projects_are_isolated_and_incremental(tmp_path) -> None:
         (project_b / "same.py").write_text("def beta():\n    return 'only-b'\n", encoding="utf-8")
         db_path = str(tmp_path / "rag.db")
         await init_db(db_path)
+        async with Database(db_path) as db:
+            await db.create_session("session-a", "dev", str(project_a), "RAG回归测试")
 
         indexer = CodeIndexer(db_path)
         counter = CountingEmbedding()
@@ -70,5 +76,24 @@ def test_projects_are_isolated_and_incremental(tmp_path) -> None:
             assert len(chunks) == 1
             assert "changed-a" in chunks[0]["content"]
             assert chunks[0]["embedding"] is None
+
+        await indexer.index_long_term_memory_entries([
+            {"category": "task", "title": "需求文档", "content": "支持项目隔离"},
+            {"category": "task", "title": "开发计划", "content": "修改索引器"},
+            {"category": "task", "title": "实现说明", "content": "使用项目路径过滤"},
+            {"category": "task", "title": "空实现说明", "content": ""},
+        ], source_session_id="session-a", project_path=str(project_a))
+        memory_results = await hybrid_retrieve(
+            "支持项目隔离",
+            source_type="memory",
+            project_path=str(project_a),
+            top_k=10,
+            db_path=db_path,
+        )
+        assert any("支持项目隔离" in item["content"] for item in memory_results)
+        async with Database(db_path) as db:
+            memory_sources = await db.list_rag_sources("memory", str(project_a))
+            assert len(memory_sources) == 3
+            assert all(item["source_path"].startswith("memory://task/") for item in memory_sources)
 
     asyncio.run(scenario())

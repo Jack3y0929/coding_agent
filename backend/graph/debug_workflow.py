@@ -409,13 +409,23 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
         # 写入长期记忆
         from backend.rag.indexer import CodeIndexer
         indexer = CodeIndexer()
-        await indexer.index_long_term_memory(
-            category="error",
-            title=f"BUG修复 - {state.get('description', '')[:50]}",
-            content=f"{state.get('diagnosis_report', '')}\n\n{summary}",
-            source_session_id=sid,
-            project_path=state.get("project_path", ""),
-        )
+        await indexer.index_long_term_memory_entries([
+            {
+                "category": "error",
+                "title": f"BUG修复原因 - {state.get('description', '')[:50]}",
+                "content": state.get("diagnosis_report") or "",
+            },
+            {
+                "category": "error",
+                "title": f"BUG修复总结 - {state.get('description', '')[:50]}",
+                "content": summary,
+            },
+            {
+                "category": "error",
+                "title": f"BUG实现说明 - {state.get('description', '')[:50]}",
+                "content": state.get("implementation_note") or "",
+            },
+        ], source_session_id=sid, project_path=state.get("project_path", ""))
 
         if code_changes:
             changed_files = [

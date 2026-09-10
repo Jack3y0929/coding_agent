@@ -406,13 +406,28 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
         # 写入长期记忆
         from backend.rag.indexer import CodeIndexer
         indexer = CodeIndexer()
-        await indexer.index_long_term_memory(
-            category="task",
-            title=f"DEV任务 - {state.get('description', '')[:50]}",
-            content=summary,
-            source_session_id=sid,
-            project_path=state.get("project_path", ""),
-        )
+        await indexer.index_long_term_memory_entries([
+            {
+                "category": "task",
+                "title": f"DEV任务 - {state.get('description', '')[:50]}",
+                "content": summary,
+            },
+            {
+                "category": "task",
+                "title": f"DEV需求 - {state.get('description', '')[:50]}",
+                "content": state.get("requirement_doc") or "",
+            },
+            {
+                "category": "task",
+                "title": f"DEV开发计划 - {state.get('description', '')[:50]}",
+                "content": state.get("plan") or "",
+            },
+            {
+                "category": "task",
+                "title": f"DEV实现说明 - {state.get('description', '')[:50]}",
+                "content": state.get("implementation_note") or "",
+            },
+        ], source_session_id=sid, project_path=state.get("project_path", ""))
 
         # 增量更新RAG索引
         if code_changes:

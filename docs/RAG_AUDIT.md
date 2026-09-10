@@ -11,7 +11,12 @@
 
 每行保留：来源类型、来源路径、项目路径、SHA-256 文件哈希、mtime、大小、符号、块序号、块内容、384 维 float32 向量 BLOB、token 估算、创建/更新时间。
 
-任务总结会同步写入 `long_term_memory` 表；RAG 检索命中记录写入 `trace_events`，事件类型为 `rag_retrieval`。
+任务完成后的产物会按需写入 `long_term_memory` 表并同步进入 RAG：
+
+- DEV：任务总结、需求文档、开发计划、实现说明。
+- DEBUG：诊断报告、修复总结、实现说明。
+
+空产物会自动跳过，不会写入 RAG。RAG 检索命中记录写入 `trace_events`，事件类型为 `rag_retrieval`。
 
 ## 每个角色分别查什么
 
