@@ -10,13 +10,18 @@ load_dotenv(override=True)
 
 # OpenAI 兼容 API 配置（当前指向百炼）
 DEEPSEEK_API_KEY: str = os.getenv("DEEPSEEK_API_KEY", "")
-DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
-DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
+DEEPSEEK_BASE_URL: str = os.getenv("DEEPSEEK_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
+DEEPSEEK_MODEL: str = os.getenv("DEEPSEEK_MODEL", "Qwen3.7-Flash")
+DEEPSEEK_FALLBACK_MODELS: List[str] = [item.strip() for item in os.getenv("DEEPSEEK_FALLBACK_MODELS", "").split(",") if item.strip()]
 
 # 预算配置
 MAX_COST_YUAN: float = 5.0
-API_TIMEOUT: float = 30.0
-MAX_RETRIES: int = 3
+# 模型请求分离连接与读取超时：复杂工具调用需要更长的响应窗口。
+API_TIMEOUT: float = float(os.getenv("API_TIMEOUT", "180"))
+API_CONNECT_TIMEOUT: float = 20.0
+API_WRITE_TIMEOUT: float = 60.0
+API_POOL_TIMEOUT: float = 20.0
+MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 
 # 项目路径配置
 PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

@@ -4,9 +4,12 @@ import asyncio
 import json
 import logging
 import uuid
+import subprocess
+import sys
+from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -25,6 +28,44 @@ logger = logging.getLogger("main")
 app = FastAPI(title="Just_codding")
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.on_event("startup")
+async def startup_event() -> None:
+    """初始化数据库并回收服务重启后遗留的工作流。"""
+    from backend.db.models import init_db
+    from backend.trace import recover_stale_traces, recover_stale_sessions
+
+    await init_db()
+    await recover_orphan_workflows()
+    recovered = await recover_stale_traces()
+    recovered_sessions = await recover_stale_sessions()
+    if recovered:
+        logger.warning("启动时回收 %s 个陈旧 Trace", recovered)
+    if recovered_sessions:
+        logger.warning("启动时回收 %s 个陈旧会话", recovered_sessions)
+
+
+async def recover_orphan_workflows() -> int:
+    """回收没有对应任务文件的遗留 running 会话。"""
+    from backend.db.models import Database
+    task_dir = Path(PROJECT_ROOT) / ".workflow_tasks"
+    async with Database() as db:
+        rows = await (await db._conn.execute(
+            "SELECT id FROM sessions WHERE status = 'running'"
+        )).fetchall()
+        recovered = 0
+        for row in rows:
+            if not (task_dir / f"{row['id']}.json").exists():
+                await db._conn.execute("UPDATE sessions SET status='failed' WHERE id=?", (row["id"],))
+                await db._conn.execute(
+                    "UPDATE workflow_traces SET status='failed', finished_at=datetime('now'), "
+                    "error_message=? WHERE session_id=? AND status='running'",
+                    ("Worker 进程已退出，任务状态自动回收", row["id"]),
+                )
+                recovered += 1
+        await db._conn.commit()
+    return recovered
 
 
 # ---- 请求模型 ----
@@ -95,14 +136,24 @@ async def start_workflow(req: StartWorkflowRequest) -> dict[str, Any]:
     """启动一个新工作流"""
     session_id = str(uuid.uuid4())[:8]
     if req.workflow_type not in (None, "dev", "debug"):
-        return {"error": f"无效的工作流类型: {req.workflow_type}"}
+        raise HTTPException(status_code=400, detail=f"无效的工作流类型: {req.workflow_type}")
     try:
         normalized_project = real_project_path(req.project_path)
     except (ValueError, OSError) as exc:
-        return {"error": f"项目路径无效: {exc}"}
+        raise HTTPException(status_code=400, detail=f"项目路径无效: {exc}") from exc
     req = req.model_copy(update={"project_path": normalized_project})
-    logger.info(f"启动工作流 session={session_id} type={req.workflow_type or 'auto'}")
-    asyncio.create_task(run_workflow_async(session_id, req))
+    logger.info(f"提交工作流 session={session_id} type={req.workflow_type or 'auto'}")
+    task_dir = Path(PROJECT_ROOT) / ".workflow_tasks"
+    task_dir.mkdir(parents=True, exist_ok=True)
+    task_file = task_dir / f"{session_id}.json"
+    task_file.write_text(json.dumps({"session_id": session_id, "request": req.model_dump()}, ensure_ascii=False), encoding="utf-8")
+    creationflags = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    subprocess.Popen(
+        [sys.executable, "-m", "backend.worker", str(task_file)],
+        cwd=PROJECT_ROOT,
+        creationflags=creationflags,
+        close_fds=(creationflags == 0),
+    )
     return {"session_id": session_id, "status": "started", "workflow_type": req.workflow_type or "auto"}
 
 
@@ -385,9 +436,13 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
         if validation.selected_workflow_type == "dev":
             from backend.graph.dev_workflow import build_dev_workflow
             graph = await build_dev_workflow()
+            from backend.artifacts import allocate_document_id
+            document_id = allocate_document_id("T")
         else:
             from backend.graph.debug_workflow import build_debug_workflow
             graph = await build_debug_workflow()
+            from backend.artifacts import allocate_document_id
+            document_id = allocate_document_id("D")
 
         initial_state = {
             "stage": "input_gate",
@@ -416,6 +471,7 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "project_path": req.project_path,
             "description": req.description,
             "workflow_type": validation.selected_workflow_type,
+            "document_id": document_id,
         }
 
         config = {"configurable": {"thread_id": session_id}}
@@ -436,6 +492,12 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "token_status": budget.get_status(),
         })
 
+    except asyncio.CancelledError as exc:
+        logger.warning("工作流 %s 被取消", session_id)
+        await update_session_status(session_id, "failed")
+        if trace_token is not None:
+            await finish_trace("failed", budget.get_status(), "工作流被服务重启或任务取消")
+        raise
     except Exception as exc:
         logger.error(f"工作流 {session_id} 异常: {exc}", exc_info=True)
         from backend.fallback.engine import budget_exceeded
@@ -495,4 +557,4 @@ async def _handle_graph_event(session_id: str, event: dict[str, Any], budget: An
 if __name__ == "__main__":
     import uvicorn
     # 与 frontend/vite.config.js 的开发代理保持一致。
-    uvicorn.run("backend.main:app", host="0.0.0.0", port=8001, reload=True)
+    uvicorn.run("backend.main:app", host="127.0.0.1", port=8000, reload=True)

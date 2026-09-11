@@ -16,9 +16,13 @@ from backend.config import (
     DEEPSEEK_API_KEY,
     DEEPSEEK_BASE_URL,
     DEEPSEEK_MODEL,
+    DEEPSEEK_FALLBACK_MODELS,
     MAX_RETRIES,
     MAX_TOOL_ROUNDS,
     API_TIMEOUT,
+    API_CONNECT_TIMEOUT,
+    API_WRITE_TIMEOUT,
+    API_POOL_TIMEOUT,
     PROJECT_ROOT,
     TOOL_CONTEXT_MAX_CHARS,
     TOOL_ROUND_MAX_CHARS,
@@ -156,7 +160,7 @@ def load_system_prompt(role: str) -> str:
 
 # ---- DeepSeek API 调用（单次） ----
 
-async def call_deepseek(
+async def _call_deepseek_once(
     messages: list[dict[str, Any]],
     tools: list[dict[str, Any]] | None = None,
     model: str = DEEPSEEK_MODEL,
@@ -171,7 +175,18 @@ async def call_deepseek(
         raise ValueError("DEEPSEEK_API_KEY 未设置")
 
     # SDK 不再自行重试，由项目层统一控制重试次数、退避和 Trace。
-    client = AsyncOpenAI(api_key=api_key, base_url=DEEPSEEK_BASE_URL, max_retries=0)
+    request_timeout = httpx.Timeout(
+        timeout=API_TIMEOUT,
+        connect=API_CONNECT_TIMEOUT,
+        write=API_WRITE_TIMEOUT,
+        pool=API_POOL_TIMEOUT,
+    )
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=DEEPSEEK_BASE_URL,
+        max_retries=0,
+        timeout=request_timeout,
+    )
 
     # 预算检查
     input_tokens = 0
@@ -193,7 +208,7 @@ async def call_deepseek(
                     model=model,
                     messages=messages,
                     tools=tools,
-                    timeout=API_TIMEOUT,
+                    timeout=request_timeout,
                 )
                 msg = response.choices[0].message
                 response_content = msg.content or ""
@@ -236,6 +251,28 @@ async def call_deepseek(
                 await __import__("asyncio").sleep(1)
 
     raise RuntimeError(f"API调用失败（已重试{MAX_RETRIES}次）: {last_error}")
+
+
+async def call_deepseek(
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None = None,
+    model: str = DEEPSEEK_MODEL,
+    api_key: str = DEEPSEEK_API_KEY,
+    budget: TokenBudget | None = None,
+) -> dict[str, Any]:
+    """调用主模型；重试耗尽后按配置顺序切换降级模型。"""
+    candidates = list(dict.fromkeys([model, *DEEPSEEK_FALLBACK_MODELS]))
+    last_error: Exception | None = None
+    for index, candidate in enumerate(candidates):
+        try:
+            return await _call_deepseek_once(messages, tools, candidate, api_key, budget)
+        except BudgetExceededError:
+            raise
+        except Exception as exc:
+            last_error = exc
+            if index < len(candidates) - 1:
+                logger.warning("模型 %s 不可用，切换降级模型 %s: %s", candidate, candidates[index + 1], exc)
+    raise RuntimeError(f"所有候选模型均调用失败: {last_error}")
 
 
 async def _call_anthropic_compatible(
@@ -285,7 +322,13 @@ async def _call_anthropic_compatible(
             "input_schema": tool["function"].get("parameters", {"type": "object"}),
         } for tool in tools]
 
-    async with httpx.AsyncClient(timeout=API_TIMEOUT) as http:
+    request_timeout = httpx.Timeout(
+        timeout=API_TIMEOUT,
+        connect=API_CONNECT_TIMEOUT,
+        write=API_WRITE_TIMEOUT,
+        pool=API_POOL_TIMEOUT,
+    )
+    async with httpx.AsyncClient(timeout=request_timeout) as http:
         response = await http.post(
             f"{DEEPSEEK_BASE_URL.rstrip('/')}/v1/messages",
             headers={"x-api-key": api_key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
@@ -335,7 +378,7 @@ async def execute_tool(
                     "path": arguments["path"], "reason": scope_error,
                 })
             else:
-                result = await write_file(target, arguments["content"], project_path=project_path or None)
+                result = await write_file(target, arguments["content"])
 
         elif tool_name == "search_code":
             result = await search_code(
@@ -441,11 +484,15 @@ async def run_fc_loop(
                 "content": (
                     "上一轮工具执行摘要（仅保留本轮结果，历史工具原文已丢弃）：\n"
                     + last_tool_summary
+                    + "\n\n请基于以上已核实信息输出最终回答；不要再调用工具。"
                 ),
             },
         ]
 
-    return last_tool_summary or (current_messages[-1].get("content", "") if current_messages else "")
+    return (
+        "工具调用轮次已达上限，模型未输出最终结论。"
+        "请基于已有摘要直接输出符合输出契约的最终报告。"
+    )
 
 
 # ---- 节点间消息构建 ----

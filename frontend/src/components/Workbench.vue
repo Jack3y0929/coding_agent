@@ -33,7 +33,18 @@ async function submitWorkflow() {
         project_path: projectPath.value,
       }),
     })
-    const data = await res.json()
+    const text = await res.text()
+    let data = {}
+    if (text.trim()) {
+      try {
+        data = JSON.parse(text)
+      } catch {
+        throw new Error(`服务器返回了非 JSON 响应（HTTP ${res.status}）`)
+      }
+    }
+    if (!res.ok) {
+      throw new Error(data.detail || data.error || `请求失败（HTTP ${res.status}）`)
+    }
     if (data.error) {
       error.value = data.error
     } else {

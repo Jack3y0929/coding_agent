@@ -65,6 +65,7 @@ class DebugWorkflowState(TypedDict):
     project_path: str
     description: str
     workflow_type: str
+    document_id: str
 
 
 # ---- 节点函数 ----
@@ -136,8 +137,11 @@ async def node_diagnose(state: DebugWorkflowState) -> dict[str, Any]:
 
     diagnosis_sufficient, diagnosis_evidence = _evaluate_diagnosis_evidence(result)
 
+    from backend.artifacts import write_diagnosis
+    diagnosis_path = write_diagnosis(state["document_id"], state["project_path"], result)
+    structured_content = open(diagnosis_path, encoding="utf-8").read()
     async with Database() as db:
-        await db.add_artifact(sid, "diagnosis", result)
+        await db.add_artifact(sid, "diagnosis", structured_content)
 
     from backend.fallback.engine import after_diagnosis
     from backend.trace import record_event, record_fallback_decision
@@ -406,10 +410,13 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
     async with Database() as db:
         await db.add_artifact(sid, "output_summary", summary)
 
-        # 写入长期记忆
-        from backend.rag.indexer import CodeIndexer
-        indexer = CodeIndexer()
-        await indexer.index_long_term_memory_entries([
+    from backend.artifacts import write_feedback
+    write_feedback(state["document_id"], state["project_path"], summary)
+
+    # 写入长期记忆
+    from backend.rag.indexer import CodeIndexer
+    indexer = CodeIndexer()
+    await indexer.index_long_term_memory_entries([
             {
                 "category": "error",
                 "title": f"BUG修复原因 - {state.get('description', '')[:50]}",
@@ -425,17 +432,17 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
                 "title": f"BUG实现说明 - {state.get('description', '')[:50]}",
                 "content": state.get("implementation_note") or "",
             },
-        ], source_session_id=sid, project_path=state.get("project_path", ""))
+    ], source_session_id=sid, project_path=state.get("project_path", ""))
 
-        if code_changes:
-            changed_files = [
+    if code_changes:
+        changed_files = [
                 f"{state['project_path']}/{fp}" if state['project_path'] else fp
                 for fp in code_changes.keys()
-            ]
-            try:
-                await indexer.incremental_update(changed_files, project_path=state.get("project_path", ""))
-            except Exception as exc:
-                logger.warning(f"增量RAG更新失败: {exc}")
+        ]
+        try:
+            await indexer.incremental_update(changed_files, project_path=state.get("project_path", ""))
+        except Exception as exc:
+            logger.warning(f"增量RAG更新失败: {exc}")
 
     await push_progress(sid, {"event": "complete", "stage": "output",
                               "message": "BUG修复完成", "summary": summary})

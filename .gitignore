@@ -3,4 +3,7 @@ __pycache__/
 *.db
 node_modules/
 dist/
+.workflow_tasks/
+logs-*.out
+logs-*.err
 .idea/

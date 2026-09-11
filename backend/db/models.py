@@ -1,3 +1,4 @@
+# -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import logging
@@ -147,6 +148,10 @@ async def init_db(db_path: str = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id);
             CREATE INDEX IF NOT EXISTS idx_artifacts_session ON artifacts(session_id);
             CREATE INDEX IF NOT EXISTS idx_rag_source ON rag_embeddings(source_path);
+        """)
+        await _migrate_schema(db)
+        await db.commit()
+        await db.executescript("""
             CREATE INDEX IF NOT EXISTS idx_rag_project_source ON rag_embeddings(project_path, source_path);
             CREATE INDEX IF NOT EXISTS idx_rag_type ON rag_embeddings(source_type);
             CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memory(category);
@@ -156,8 +161,6 @@ async def init_db(db_path: str = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_trace_labels_trace ON trace_labels(trace_id, id);
             CREATE INDEX IF NOT EXISTS idx_trace_evaluations_trace ON trace_evaluations(trace_id, metric_name);
         """)
-        await _migrate_schema(db)
-        await db.commit()
     logger.info("数据库初始化完成")
 
 

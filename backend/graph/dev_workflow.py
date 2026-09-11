@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+from pathlib import Path
 from typing import Any, Literal, TypedDict
 
 from langgraph.graph import StateGraph, END
@@ -62,6 +63,7 @@ class DevWorkflowState(TypedDict):
     project_path: str
     description: str
     workflow_type: str
+    document_id: str
 
 
 # ---- 节点函数 ----
@@ -124,8 +126,11 @@ async def node_analyze(state: DevWorkflowState) -> dict[str, Any]:
     except BudgetExceededError:
         result = "# 需求概括文档\n\n（预算超限，分析未完成）\n"
 
+    from backend.artifacts import write_requirement
+    requirement_path = write_requirement(state["document_id"], state["project_path"], result)
+    structured_content = open(requirement_path, encoding="utf-8").read()
     async with Database() as db:
-        await db.add_artifact(sid, "requirement", result)
+        await db.add_artifact(sid, "requirement", structured_content)
 
     logger.info(f"[{sid}] 需求概括文档已生成 ({len(result)} 字符)")
     return {"requirement_doc": result, "token_used": budget.total_input_tokens + budget.total_output_tokens}
@@ -164,6 +169,9 @@ async def node_develop_plan(state: DevWorkflowState) -> dict[str, Any]:
 
     async with Database() as db:
         await db.add_artifact(sid, "plan", plan)
+
+    from backend.artifacts import write_prompt
+    write_prompt(state["document_id"], state["project_path"], plan)
 
     logger.info(f"[{sid}] 开发方案已生成 ({len(plan)} 字符)")
     return {"plan": plan, "stage": "develop_build",
@@ -205,6 +213,13 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
     async with Database() as db:
         await db.add_artifact(sid, "code_changes",
                               json.dumps(code_changes, ensure_ascii=False))
+
+    from backend.artifacts import write_example_code
+    write_example_code(
+        state["document_id"],
+        state["project_path"],
+        json.dumps(code_changes, ensure_ascii=False, indent=2),
+    )
 
     logger.info(f"[{sid}] 代码开发完成 ({len(result_text)} 字符)")
     return {
@@ -269,30 +284,71 @@ async def node_review_aggregate(state: DevWorkflowState) -> dict[str, Any]:
 
 
 async def node_validate(state: DevWorkflowState) -> dict[str, Any]:
-    """在审查前执行用户确认的白名单验证命令。"""
+    """在审查前执行确定性产物门禁和用户确认的验证命令。"""
     sid = state["session_id"]
     from backend.intent.models import CodingIntent
     from backend.tools.shell_tools import execute_shell
     from backend.trace import record_event
 
     intent = CodingIntent.model_validate(state["coding_intent"])
+    checks = _validate_dev_artifacts(state, intent)
     commands = intent.validation_commands
-    if not commands:
-        await record_event("validation_result", "validation", {"passed": True, "skipped": True})
+    if not commands and checks["passed"]:
+        await record_event("validation_result", "validation", checks)
         from backend.fallback.engine import after_validation
         from backend.trace import record_fallback_decision
         await record_fallback_decision(after_validation(True, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS), "validate")
         return {"validation_passed": True}
     await push_progress(sid, {"event": "progress", "stage": "validate", "message": "执行验证命令中..."})
     results = [await execute_shell(command, cwd=state["project_path"]) for command in commands]
-    passed = all("[exit_code: 0]" in result for result in results)
+    passed = checks["passed"] and all("[exit_code: 0]" in result for result in results)
     await record_event("validation_result", "validation", {
-        "passed": passed, "commands": commands, "results": [result[:1000] for result in results],
+        "passed": passed, "artifact_checks": checks, "commands": commands,
+        "results": [result[:1000] for result in results],
     })
     from backend.fallback.engine import after_validation
     from backend.trace import record_fallback_decision
     await record_fallback_decision(after_validation(passed, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS), "validate")
     return {"validation_passed": passed}
+
+
+def _validate_dev_artifacts(state: DevWorkflowState, intent: Any) -> dict[str, Any]:
+    """验证实际文件和关键内容，防止仅输出说明文本就进入审查。"""
+    root = Path(state["project_path"])
+    changes = state.get("code_changes") or {}
+    paths = [str(path) for path in changes.keys()]
+    required = []
+    description = f"{intent.task_description} {' '.join(intent.acceptance_criteria)}".lower()
+    if "hello-dev" in description or "index.html" in description:
+        required = ["hello-dev/index.html", "hello-dev/style.css", "hello-dev/script.js", "hello-dev/README.md"]
+    errors: list[str] = []
+    if not changes:
+        errors.append("代码变更为空，Build 未产生 write_file 结果")
+    for relative in required:
+        path = root / relative
+        if not path.is_file():
+            errors.append(f"缺少文件: {relative}")
+            continue
+        if not path.read_text(encoding="utf-8", errors="replace").strip():
+            errors.append(f"文件为空: {relative}")
+    existing = {p.replace("\\", "/") for p in paths}
+    if required and not all(item in existing for item in required):
+        errors.append("代码变更清单未覆盖全部需求文件")
+    html = root / "hello-dev/index.html"
+    js = root / "hello-dev/script.js"
+    if html.is_file():
+        content = html.read_text(encoding="utf-8", errors="replace").lower()
+        if "<html" not in content or "<script" not in content:
+            errors.append("index.html 缺少基本 HTML 或 script 结构")
+        if "hello dev" not in content:
+            errors.append("index.html 未包含 Hello DEV")
+    if js.is_file():
+        content = js.read_text(encoding="utf-8", errors="replace")
+        if "addEventListener" not in content and "onclick" not in content:
+            errors.append("script.js 未发现按钮交互绑定")
+        if "DEV" not in content:
+            errors.append("script.js 未包含成功状态文案")
+    return {"passed": not errors, "required_files": required, "errors": errors}
 
 
 async def node_fix(state: DevWorkflowState) -> dict[str, Any]:
@@ -403,10 +459,13 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
     async with Database() as db:
         await db.add_artifact(sid, "output_summary", summary)
 
-        # 写入长期记忆
-        from backend.rag.indexer import CodeIndexer
-        indexer = CodeIndexer()
-        await indexer.index_long_term_memory_entries([
+    from backend.artifacts import write_feedback
+    write_feedback(state["document_id"], state["project_path"], summary)
+
+    # 写入长期记忆
+    from backend.rag.indexer import CodeIndexer
+    indexer = CodeIndexer()
+    await indexer.index_long_term_memory_entries([
             {
                 "category": "task",
                 "title": f"DEV任务 - {state.get('description', '')[:50]}",
@@ -427,18 +486,18 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
                 "title": f"DEV实现说明 - {state.get('description', '')[:50]}",
                 "content": state.get("implementation_note") or "",
             },
-        ], source_session_id=sid, project_path=state.get("project_path", ""))
+    ], source_session_id=sid, project_path=state.get("project_path", ""))
 
-        # 增量更新RAG索引
-        if code_changes:
-            changed_files = [
+    # 增量更新RAG索引
+    if code_changes:
+        changed_files = [
                 f"{state['project_path']}/{fp}" if state['project_path'] else fp
                 for fp in code_changes.keys()
-            ]
-            try:
-                await indexer.incremental_update(changed_files, project_path=state.get("project_path", ""))
-            except Exception as exc:
-                logger.warning(f"增量RAG更新失败: {exc}")
+        ]
+        try:
+            await indexer.incremental_update(changed_files, project_path=state.get("project_path", ""))
+        except Exception as exc:
+            logger.warning(f"增量RAG更新失败: {exc}")
 
     await push_progress(sid, {"event": "complete", "stage": "output",
                               "message": "工作流完成", "summary": summary})

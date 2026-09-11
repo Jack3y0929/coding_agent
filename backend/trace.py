@@ -149,6 +149,31 @@ async def finish_trace(
     )
 
 
+async def recover_stale_traces(max_age_minutes: int = 30) -> int:
+    """将服务重启或异常退出遗留的 running Trace 标记为失败。"""
+    async with Database() as db:
+        cursor = await db._conn.execute(
+            "UPDATE workflow_traces SET status = 'failed', finished_at = ?, "
+            "error_message = ? WHERE status = 'running' "
+            "AND started_at < datetime('now', ?)",
+            (_now(), "工作流未正常收尾，已在服务启动时自动回收", f"-{max_age_minutes} minutes"),
+        )
+        await db._conn.commit()
+        return int(cursor.rowcount or 0)
+
+
+async def recover_stale_sessions(max_age_minutes: int = 30) -> int:
+    """将服务重启遗留的 running 会话标记为失败。"""
+    async with Database() as db:
+        cursor = await db._conn.execute(
+            "UPDATE sessions SET status = 'failed' WHERE status = 'running' "
+            "AND created_at < datetime('now', ?)",
+            (f"-{max_age_minutes} minutes",),
+        )
+        await db._conn.commit()
+        return int(cursor.rowcount or 0)
+
+
 async def update_trace_workflow_type(trace_id: str, workflow_type: str) -> None:
     """在自动识别或澄清后记录最终实际执行的工作流类型。"""
     async with Database() as db:
