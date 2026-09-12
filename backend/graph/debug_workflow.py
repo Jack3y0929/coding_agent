@@ -40,6 +40,7 @@ class DebugWorkflowState(TypedDict):
     diagnosis_evidence: dict[str, Any]
     new_logs: str | None
     code_changes: dict[str, str] | None
+    fix_execution: dict[str, Any] | None
     implementation_note: str | None
     review_report: str | None
     review_logic_report: str | None
@@ -240,13 +241,33 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
     messages = build_node_messages(system_prompt, user_content)
     budget = get_workflow_budget()
 
+    execution_report: dict[str, Any] = {"successful_writes": [], "failed_writes": [], "tool_calls": []}
     try:
         result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
-                                        state["project_path"])
+                                        state["project_path"], execution_report)
     except BudgetExceededError:
         result_text = "## 代码变更\n\n（预算超限，修复未完成）\n\n## 实现说明\n\n修复被中断。\n"
 
-    code_changes, impl_note = _parse_developer_output(result_text)
+    code_changes = dict(state.get("code_changes") or {})
+    code_changes.update(_changes_from_execution(execution_report))
+    impl_note = _parse_implementation_note(result_text)
+    from backend.trace import record_event
+    from backend.fallback.engine import after_build
+    from backend.trace import record_fallback_decision
+    await record_event("build_execution", "fix", {
+        "successful_writes": [item["path"] for item in execution_report.get("successful_writes", [])],
+        "failed_writes": [item["path"] for item in execution_report.get("failed_writes", [])],
+        "tool_call_count": len(execution_report.get("tool_calls", [])),
+        "passed": bool(execution_report.get("successful_writes")),
+    })
+    await record_fallback_decision(after_build(
+        len(execution_report.get("successful_writes") or []), fix_attempt, MAX_FIX_ATTEMPTS,
+    ), "fix")
+    if not execution_report.get("successful_writes"):
+        await push_progress(sid, {
+            "event": "progress", "stage": "fix",
+            "message": f"修复未产生实际文件，第{fix_attempt}次重试...",
+        })
 
     async with Database() as db:
         await db.add_artifact(sid, "code_changes",
@@ -255,6 +276,7 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
     logger.info(f"[{sid}] BUG修复完成 (第{fix_attempt}次)")
     return {
         "code_changes": code_changes,
+        "fix_execution": execution_report,
         "implementation_note": impl_note,
         "fix_attempt": fix_attempt,
         "token_used": budget.total_input_tokens + budget.total_output_tokens,
@@ -355,6 +377,16 @@ async def node_validate(state: DebugWorkflowState) -> dict[str, Any]:
     from backend.fallback.engine import after_validation
 
     intent = CodingIntent.model_validate(state["coding_intent"])
+    execution = state.get("fix_execution") or {}
+    if not execution.get("successful_writes"):
+        checks = {
+            "passed": False,
+            "errors": ["代码变更为空，FIX 未产生 write_file 结果"],
+            "successful_writes": [],
+        }
+        await record_event("validation_result", "validation", checks)
+        await record_fallback_decision(after_validation(False, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS), "validate")
+        return {"validation_passed": False}
     commands = intent.validation_commands
     if not commands:
         await record_event("validation_result", "validation", {"passed": True, "skipped": True})
@@ -381,7 +413,11 @@ async def node_human_intervene(state: DebugWorkflowState) -> dict[str, Any]:
     from backend.fallback.engine import after_intervention
     from backend.trace import record_fallback_decision
     await record_fallback_decision(after_intervention(decision), "human_intervene")
-    return {"intervention_decision": decision, "status": "running"}
+    return {
+        "intervention_decision": decision,
+        "fix_attempt": 0 if decision == "retry" else state.get("fix_attempt", 0),
+        "status": "running",
+    }
 
 
 async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
@@ -392,11 +428,12 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
     file_count = len(code_changes)
     review_rounds = state.get("review_round", 0)
     total_tokens = state.get("token_used", 0)
+    summary_title = "# BUG修复完成" if code_changes else "# 自动化任务已停止"
 
     diagnosis_sufficient = state.get("diagnosis_sufficient", False)
 
     summary = (
-        f"# BUG修复完成\n\n"
+        f"{summary_title}\n\n"
         f"- 变更文件数: {file_count}\n"
         f"- 审查轮次: {review_rounds}\n"
         f"- 总Token消耗: {total_tokens}\n"
@@ -457,6 +494,18 @@ def route_after_diagnose(state: DebugWorkflowState) -> Literal["fix", "add_loggi
     """诊断后路由：论据充足→修复，不足→加日志"""
     from backend.fallback.engine import after_diagnosis
     return after_diagnosis(state.get("diagnosis_sufficient", False)).next_stage or "add_logging"
+
+
+def route_after_fix(state: DebugWorkflowState) -> Literal["validate", "fix", "human_intervene"]:
+    """FIX 未产生真实写入时，禁止进入验证节点。"""
+    from backend.fallback.engine import after_build
+    execution = state.get("fix_execution") or {}
+    decision = after_build(
+        len(execution.get("successful_writes") or []),
+        state.get("fix_attempt", 0),
+        MAX_FIX_ATTEMPTS,
+    )
+    return "fix" if decision.next_stage == "develop_build" else (decision.next_stage or "human_intervene")
 
 
 def route_after_validation(state: DebugWorkflowState) -> Literal["review", "fix", "human_intervene"]:
@@ -529,7 +578,9 @@ async def build_debug_workflow() -> StateGraph:
     workflow.add_edge("human_wait", "diagnose")  # 用户提供新日志后重新诊断
 
     # 修复→审查
-    workflow.add_edge("fix", "validate")
+    workflow.add_conditional_edges("fix", route_after_fix, {
+        "validate": "validate", "fix": "fix", "human_intervene": "human_intervene",
+    })
     workflow.add_conditional_edges("validate", route_after_validation, {
         "review": "review_start", "fix": "fix", "human_intervene": "human_intervene",
     })
@@ -663,27 +714,21 @@ def _evaluate_diagnosis_evidence(report: str) -> tuple[bool, dict[str, Any]]:
     }
     return not checks_failed, evidence_data
 
-def _parse_developer_output(text: str) -> tuple[dict[str, str], str]:
-    """从开发者输出文本中解析代码变更和实现说明"""
-    code_changes: dict[str, str] = {}
-    impl_note = text
+def _parse_implementation_note(text: str) -> str:
+    """只提取实现说明；文本本身永远不视为文件变更。"""
+    if "## 实现说明" not in text:
+        return text.strip()
+    return text.split("## 实现说明", 1)[1].strip()
 
-    if "## 代码变更" in text:
-        parts = text.split("## 代码变更", 1)
-        if len(parts) > 1:
-            changes_section = parts[1]
-            if "## 实现说明" in changes_section:
-                changes_text, impl_section = changes_section.split("## 实现说明", 1)
-                impl_note = impl_section.strip()
-            else:
-                changes_text = changes_section
-            code_changes = {"output.txt": changes_text.strip()}
-    elif "## 实现说明" in text:
-        code_changes = {"output.txt": text}
-    else:
-        code_changes = {"output.txt": text}
 
-    return code_changes, impl_note
+def _changes_from_execution(execution_report: dict[str, Any]) -> dict[str, str]:
+    """将成功 write_file 调用转换为正式代码变更，重复路径以后一次为准。"""
+    changes: dict[str, str] = {}
+    for item in execution_report.get("successful_writes", []):
+        path = str(item.get("path", "")).replace("\\", "/").strip()
+        if path:
+            changes[path] = str(item.get("content", ""))
+    return changes
 
 
 async def _resolve_intent_slots(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from typing import Optional
 
 from backend.config import SHELL_WHITELIST
@@ -11,10 +12,14 @@ logger = logging.getLogger("tools.shell")
 
 
 def validate_command(command: str) -> bool:
-    """检查命令是否在白名单内（前缀匹配）"""
+    """检查命令是否在白名单内，并拒绝Shell组合语法。"""
     cmd = command.strip()
+    # 白名单命令必须是单条命令；禁止借助 shell 元字符逃逸白名单。
+    if not cmd or re.search(r"[&|;<>`\r\n]", cmd):
+        logger.warning(f"Shell命令被拒绝（包含组合/重定向语法）: {cmd}")
+        return False
     for allowed in SHELL_WHITELIST:
-        if cmd.startswith(allowed):
+        if cmd == allowed or cmd.startswith(allowed + " "):
             return True
     logger.warning(f"Shell命令被拒绝（不在白名单）: {cmd}")
     return False

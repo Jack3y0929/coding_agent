@@ -26,6 +26,7 @@ const intentInfo = ref(null)
 const intentValidation = ref(null)
 const slotForm = ref(defaultSlots())
 const selectedClarifications = ref({})
+const logInput = ref('')
 
 function defaultAcceptance() {
   return {
@@ -51,6 +52,7 @@ function splitLines(value) {
 
 let ws = null
 let reconnectTimer = null
+let statusTimer = null
 
 const statusColor = computed(() => {
   if (isError.value) return '#f85149'
@@ -257,6 +259,15 @@ async function restoreStatus() {
   }
 }
 
+function startStatusPolling() {
+  if (statusTimer) clearTimeout(statusTimer)
+  const poll = async () => {
+    await restoreStatus()
+    if (!isComplete.value && !isError.value) statusTimer = setTimeout(poll, 1500)
+  }
+  poll()
+}
+
 watch(() => props.workflowType, value => {
   if (value) currentWorkflowType.value = value
 })
@@ -271,17 +282,28 @@ async function sendDecision(decision) {
       if (decision === 'rejected') payload.outcome = 'rejected'
       delete payload.issue_types_text
     }
+    if (pauseStage.value === 'human_wait') {
+      payload.new_logs = logInput.value
+    }
     if (pauseStage.value === 'intent_clarify') {
       Object.assign(payload, selectedClarifications.value)
       if (slotForm.value.intent_workflow_type) payload.intent_workflow_type = slotForm.value.intent_workflow_type
     }
-    await fetch('/api/workflow/resume', {
+    const response = await fetch('/api/workflow/resume', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
     })
+    const result = await response.json()
+    if (result.status !== 'resumed') {
+      currentMessage.value = result.message || '恢复失败，请刷新后重试'
+      return
+    }
     isPaused.value = false
-    currentMessage.value = decision === 'approved' ? '已确认，继续执行...' : '已退回修复...'
+    logInput.value = ''
+    currentMessage.value = ['approved', 'retry', 'slots_provided', 'logs_provided'].includes(decision)
+      ? '已确认，继续执行...'
+      : '已退回修复...'
   } catch (e) {
     console.error('发送决策失败:', e)
   }
@@ -294,13 +316,14 @@ function goBack() {
 
 onMounted(() => {
   connectWebSocket()
-  restoreStatus()
+  startStatusPolling()
   restoreTraceEvents()
 })
 
 onUnmounted(() => {
   if (ws) ws.close()
   if (reconnectTimer) clearTimeout(reconnectTimer)
+  if (statusTimer) clearTimeout(statusTimer)
 })
 
 watch(() => props.sessionId, () => {
@@ -312,8 +335,9 @@ watch(() => props.sessionId, () => {
   acceptance.value = defaultAcceptance()
   selectedClarifications.value = {}
   traceEvents.value = []
+  logInput.value = ''
   connectWebSocket()
-  restoreStatus()
+  startStatusPolling()
   restoreTraceEvents()
 })
 </script>
@@ -414,6 +438,7 @@ watch(() => props.sessionId, () => {
             class="log-input"
             rows="4"
             placeholder="粘贴复现后的日志..."
+            v-model="logInput"
           ></textarea>
           <div class="pause-actions">
             <button class="btn-approve" @click="sendDecision('logs_provided')">提交日志</button>

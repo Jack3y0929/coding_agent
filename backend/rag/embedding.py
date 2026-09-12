@@ -7,7 +7,7 @@ from typing import Optional
 
 import numpy as np
 
-from backend.config import EMBEDDING_MODEL, RAG_EMBEDDING_BACKEND
+from backend.config import EMBEDDING_MODEL, EMBEDDING_MODEL_VERSION, RAG_EMBEDDING_BACKEND
 
 logger = logging.getLogger("rag.embedding")
 
@@ -18,7 +18,8 @@ class EmbeddingEngine:
     def __init__(self, model_name: str = EMBEDDING_MODEL) -> None:
         self.model_name = model_name
         self._model: Optional[object] = None
-        self.dimension: int = 384  # all-MiniLM-L6-v2 输出维度
+        self.dimension: int = 0
+        self.model_version = EMBEDDING_MODEL_VERSION
         self._use_hash = RAG_EMBEDDING_BACKEND.lower() in {"hash", "fallback"}
 
     def _load_model(self) -> object:
@@ -55,6 +56,8 @@ class EmbeddingEngine:
 
     def _hash_encode(self, text: str | list[str]) -> np.ndarray:
         """无模型时的确定性词袋向量，保证本地离线 RAG 仍可工作。"""
+        if self.dimension <= 0:
+            self.dimension = 1024 if "bge-m3" in self.model_name.lower() else 384
         values = [text] if isinstance(text, str) else text
         matrix = np.zeros((len(values), self.dimension), dtype=np.float32)
         for row, value in enumerate(values):
@@ -76,6 +79,15 @@ class EmbeddingEngine:
     def decode_from_bytes(self, data: bytes) -> np.ndarray:
         """从字节解码回向量"""
         return np.frombuffer(data, dtype=np.float32)
+
+    @property
+    def metadata(self) -> dict[str, str | int]:
+        """当前向量的可持久化元数据。"""
+        return {
+            "embedding_model": self.model_name,
+            "embedding_model_version": self.model_version,
+            "embedding_dimension": self.dimension,
+        }
 
     def batch_encode_to_bytes(self, texts: list[str]) -> list[bytes]:
         """批量编码为字节列表"""

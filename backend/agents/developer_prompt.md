@@ -22,11 +22,15 @@
 - **Build模式下所有操作需通过安全校验**
 
 #### Shell命令与验证目录
-- `execute_shell` 会自动使用当前任务的 `project_path` 作为工作目录；不要在命令中执行 `cd`、`dir`、`ls`、`pwd`、`Set-Location`。
+- `execute_shell` 会自动使用当前任务的 `project_path` 作为工作目录；禁止使用 `cd`、`ls`、`pwd`、`Set-Location` 做目录切换。允许使用白名单中的只读 `dir`/`tree` 查看文件结构，但不得与 `&&`、管道、重定向等组合。
 - 不要使用 `&&`、`||`、`;`、管道或重定向组合命令；源码浏览使用 `read_file` / `search_code`。
 - 验证命令必须从项目根目录直接执行。前端项目位于 `frontend` 子目录时，使用 `npm run build --prefix frontend`、`npm run lint --prefix frontend` 或 `npm run typecheck --prefix frontend`。
 - Python 测试使用 `pytest` 或 `python -m pytest`；Git 检查使用 `git status`、`git diff`、`git log --oneline`。
 - 输出验证命令前，确认命令以 Shell 白名单中的前缀开头，并且不要把 `npm run build` 用于没有 `package.json` 的项目根目录。
+
+#### 实际写入门禁
+- Build/FIX 阶段必须通过 `write_file` 工具写入实际目标文件；只在回复中展示 Markdown、diff 或“代码变更”说明不算完成。
+- 没有成功的 `write_file` 调用时，必须明确报告未完成，不得声称已产生代码变更。
 
 ## 输入
 

@@ -19,6 +19,25 @@ def after_validation(validation_passed: bool, fix_attempt: int, max_attempts: in
     return _human_intervene("validation_retry_exhausted", "验证持续失败，已达到自动修复上限", fix_attempt)
 
 
+def after_build(successful_writes: int, build_attempt: int, max_attempts: int) -> FallbackDecision:
+    """Build 产出门禁：没有真实写入时不得进入验证。"""
+    if successful_writes > 0:
+        return FallbackDecision(
+            action="continue", reason_code="build_writes_present", reason="Build 已产生实际文件写入",
+            next_stage="validate", input_snapshot={"successful_writes": successful_writes},
+        )
+    if build_attempt < max_attempts:
+        return FallbackDecision(
+            action="retry", reason_code="build_no_write", reason="Build 未产生任何成功的 write_file 结果",
+            next_stage="develop_build", retryable=True,
+            input_snapshot={"build_attempt": build_attempt},
+        )
+    return _human_intervene(
+        "build_no_write_retry_exhausted", "Build 连续未产生实际文件写入，已达到重试上限", build_attempt,
+        {"successful_writes": successful_writes},
+    )
+
+
 def after_review(
     review_passed: bool,
     review_round: int,

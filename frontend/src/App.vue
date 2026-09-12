@@ -66,6 +66,13 @@ function onWorkflowFinished() {
   clearActiveTask()
 }
 
+function resumeTraceTask(task) {
+  sessionId.value = task.session_id
+  workflowType.value = task.workflow_type
+  saveActiveTask(task)
+  view.value = 'progress'
+}
+
 onMounted(() => {
   restoreActiveTask()
 })
@@ -95,7 +102,7 @@ onMounted(() => {
         @back="onBackToWorkbench"
         @finished="onWorkflowFinished"
       />
-      <TraceDashboard v-else-if="view === 'traces'" />
+      <TraceDashboard v-else-if="view === 'traces'" @resume="resumeTraceTask" />
       <EvaluationPanel v-else-if="view === 'evaluation'" />
       <PreferencePanel v-else-if="view === 'preferences'" />
     </main>

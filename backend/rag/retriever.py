@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import hashlib
 from typing import Any
 
 import numpy as np
@@ -69,6 +70,8 @@ async def hybrid_retrieve(
     source_type: str | None = None,
     project_path: str | None = None,
     db_path: str | None = None,
+    scope_types: list[str] | None = None,
+    scope_key: str = "",
 ) -> list[dict[str, Any]]:
     """
     混合检索：关键词搜索 + 语义搜索 → RRF融合 → 返回top_k条
@@ -85,10 +88,14 @@ async def hybrid_retrieve(
         except ValueError:
             return []
 
-    keyword_results = await _keyword_search(query, source_type=source_type, top_k=top_k * 2, project_path=project_path, db_path=db_path)
+    keyword_results = await _keyword_search(query, source_type=source_type, top_k=top_k * 2,
+                                            project_path=project_path, db_path=db_path,
+                                            scope_types=scope_types, scope_key=scope_key)
 
     query_vec = engine.encode(query)
-    semantic_results = await _semantic_search(query_vec, source_type=source_type, top_k=top_k * 2, project_path=project_path, db_path=db_path)
+    semantic_results = await _semantic_search(query_vec, source_type=source_type, top_k=top_k * 2,
+                                              project_path=project_path, db_path=db_path,
+                                              scope_types=scope_types, scope_key=scope_key)
 
     fused = rrf_fusion(keyword_results, semantic_results)
     results = fused[:top_k]
@@ -107,6 +114,7 @@ async def hybrid_retrieve_for_role(
     top_k: int = 5,
     project_path: str | None = None,
     db_path: str | None = None,
+    team_id: str = "",
 ) -> str:
     """
     根据角色进行混合检索，返回格式化的上下文字符串。
@@ -117,19 +125,28 @@ async def hybrid_retrieve_for_role(
     - debugger: 源码 top 8 + 历史错误 top 3
     """
     if role == "analyst":
-        results = await hybrid_retrieve(query, top_k=3, source_type="memory", project_path=project_path, db_path=db_path)
+        results = await hybrid_retrieve(query, top_k=3, source_type="spec", project_path=project_path, db_path=db_path,
+                                        scope_types=["global", "team"], scope_key=team_id)
+        results += await hybrid_retrieve(query, top_k=5, source_type="memory", project_path=project_path, db_path=db_path,
+                                         scope_types=["global", "team", "project"], scope_key=team_id)
     elif role in ("developer", "fix"):
-        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path)
-        mem_results = await hybrid_retrieve(query, top_k=2, source_type="memory", project_path=project_path, db_path=db_path)
+        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path,
+                                              scope_types=["project"], scope_key=team_id)
+        mem_results = await hybrid_retrieve(query, top_k=2, source_type="memory", project_path=project_path, db_path=db_path,
+                                            scope_types=["global", "team", "project"], scope_key=team_id)
         results = code_results + mem_results
     elif role in ("reviewer", "review_logic", "review_security", "review_quality"):
-        results = await hybrid_retrieve(query, top_k=5, source_type="spec", project_path=project_path, db_path=db_path)
+        results = await hybrid_retrieve(query, top_k=5, source_type="spec", project_path=project_path, db_path=db_path,
+                                        scope_types=["global", "team"], scope_key=team_id)
         # 同时检索错误模式库
-        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path)
+        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path,
+                                               scope_types=["global", "team", "project"], scope_key=team_id)
         results = rrf_fusion(results, error_results)[:top_k]
     elif role == "debugger":
-        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path)
-        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path)
+        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path,
+                                              scope_types=["project"], scope_key=team_id)
+        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path,
+                                               scope_types=["global", "team", "project"], scope_key=team_id)
         results = rrf_fusion(code_results, error_results)[:top_k]
     else:
         results = await hybrid_retrieve(query, top_k=top_k, project_path=project_path, db_path=db_path)
@@ -187,10 +204,14 @@ def _format_rag_context(results: list[dict[str, Any]]) -> str:
 
 async def _keyword_search(query: str, source_type: str | None = None,
                           top_k: int = 20, project_path: str | None = None,
-                          db_path: str | None = None) -> list[dict]:
+                          db_path: str | None = None,
+                          scope_types: list[str] | None = None,
+                          scope_key: str = "") -> list[dict]:
     """关键词检索：SQL LIKE模糊匹配"""
     async with (Database(db_path) if db_path else Database()) as db:
-        results = await db.keyword_search_rag(query, source_type=source_type, limit=top_k, project_path=project_path)
+        results = await db.keyword_search_rag(query, source_type=source_type, limit=top_k,
+                                              project_path=project_path, scope_types=scope_types,
+                                              scope_key=scope_key)
     return [{
         "id": r["id"],
         "content": r["content"],
@@ -204,10 +225,13 @@ async def _keyword_search(query: str, source_type: str | None = None,
 
 async def _semantic_search(query_vec: np.ndarray, source_type: str | None = None,
                            top_k: int = 20, project_path: str | None = None,
-                           db_path: str | None = None) -> list[dict]:
+                           db_path: str | None = None,
+                           scope_types: list[str] | None = None,
+                           scope_key: str = "") -> list[dict]:
     """语义检索：加载所有向量，计算余弦相似度，取top_k"""
     async with (Database(db_path) if db_path else Database()) as db:
-        all_embeddings = await db.get_all_rag_embeddings(source_type=source_type, project_path=project_path)
+        all_embeddings = await db.get_all_rag_embeddings(source_type=source_type, project_path=project_path,
+                                                         scope_types=scope_types, scope_key=scope_key)
 
     if source_type:
         all_embeddings = [e for e in all_embeddings if e.get("source_type") == source_type]
@@ -224,6 +248,10 @@ async def _semantic_search(query_vec: np.ndarray, source_type: str | None = None
             logger.warning("跳过损坏的 RAG 向量: id=%s", item.get("id"))
             continue
         stored_vec = np.frombuffer(emb_data, dtype=np.float32)
+        if stored_vec.shape != query_vec.shape:
+            logger.debug("跳过维度不匹配的 RAG 向量: id=%s dim=%s query_dim=%s",
+                         item.get("id"), stored_vec.size, query_vec.size)
+            continue
         sim = cosine_similarity(query_vec, stored_vec)
         scored.append({
             "id": item["id"],
@@ -274,9 +302,15 @@ async def init_spec_library() -> None:
     engine = get_embedding_engine()
     async with Database() as db:
         for source_type, title, content in RULE_ENTRIES:
-            existing = await db.keyword_search_rag(title, source_type="spec", limit=1)
+            existing = await db.get_rag_by_source(f"spec://{title}")
+            if existing and all(
+                item.get("embedding_model") == engine.model_name
+                and item.get("embedding_model_version") == engine.model_version
+                for item in existing
+            ):
+                continue  # 当前模型版本已存在则跳过
             if existing:
-                continue  # 已存在则跳过
+                await db.delete_rag_by_source(f"spec://{title}")
 
             emb_bytes = engine.encode_to_bytes(content)
             await db.insert_rag_embedding(
@@ -286,5 +320,10 @@ async def init_spec_library() -> None:
                 content=f"【{title}】{content}",
                 embedding=emb_bytes,
                 token_count=len(content),
+                scope_type="global",
+                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
+                embedding_model=engine.model_name,
+                embedding_model_version=engine.model_version,
+                embedding_dimension=engine.dimension,
             )
     logger.info("规范库初始化完成")

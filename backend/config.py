@@ -29,6 +29,15 @@ DB_PATH: str = os.path.join(PROJECT_ROOT, "just_codding.db")
 
 # Shell 命令白名单
 SHELL_WHITELIST: List[str] = [
+    # 只读目录与环境探测
+    "dir",
+    "tree",
+    "where",
+    "node --version",
+    "npm --version",
+    "python --version",
+    # 前端/JavaScript 校验
+    "node --check",
     "cargo check",
     "cargo build",
     "cargo test",
@@ -39,13 +48,16 @@ SHELL_WHITELIST: List[str] = [
     "npx tsc --noEmit",
     "pytest",
     "python -m pytest",
+    "python -m compileall",
     "git diff",
+    "git diff --check",
     "git status",
     "git log --oneline",
 ]
 
-# RAG 配置
-EMBEDDING_MODEL: str = "all-MiniLM-L6-v2"
+# RAG 配置。模型切换后通过版本字段拒绝混用旧向量。
+EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")
+EMBEDDING_MODEL_VERSION: str = os.getenv("EMBEDDING_MODEL_VERSION", "bge-m3-v1")
 RAG_EMBEDDING_BACKEND: str = os.getenv("RAG_EMBEDDING_BACKEND", "sentence-transformers")
 CHUNK_MAX_TOKENS: int = 500
 

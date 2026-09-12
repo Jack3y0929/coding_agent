@@ -354,6 +354,7 @@ async def execute_tool(
     arguments: dict[str, Any],
     mode: str,
     project_path: str = "",
+    execution_report: dict[str, Any] | None = None,
 ) -> str:
     """执行FC工具调用，mode为'plan'或'build'"""
     if mode == "plan" and tool_name in ("write_file", "execute_shell"):
@@ -417,6 +418,18 @@ async def execute_tool(
             "tool": tool_name, "arguments": arguments,
             "result": result[:1000],
         })
+        if execution_report is not None:
+            execution_report.setdefault("tool_calls", []).append(tool_name)
+            if tool_name == "write_file":
+                write_record = {
+                    "path": str(arguments.get("path", "")),
+                    "content": str(arguments.get("content", "")),
+                    "result": result[:500],
+                }
+                if result.startswith("写入成功:"):
+                    execution_report.setdefault("successful_writes", []).append(write_record)
+                else:
+                    execution_report.setdefault("failed_writes", []).append(write_record)
         return result
 
     except Exception as exc:
@@ -436,6 +449,7 @@ async def run_fc_loop(
     budget: TokenBudget,
     mode: str,
     project_path: str,
+    execution_report: dict[str, Any] | None = None,
 ) -> str:
     """
     运行 FC 工具循环：发送消息 → 检查 tool_calls → 执行工具 → 继续。
@@ -465,7 +479,9 @@ async def run_fc_loop(
             except json.JSONDecodeError:
                 func_args = {}
 
-            tool_result = await execute_tool(func_name, func_args, mode, project_path)
+            tool_result = await execute_tool(
+                func_name, func_args, mode, project_path, execution_report
+            )
             bounded_result = tool_result[:TOOL_CONTEXT_MAX_CHARS]
             if len(tool_result) > TOOL_CONTEXT_MAX_CHARS:
                 bounded_result += "\n...（工具结果已截断，必要时请缩小读取范围）"

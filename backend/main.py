@@ -19,7 +19,6 @@ from backend.graph.context import (
     push_progress,
     register_ws,
     unregister_ws,
-    resume_session,
 )
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -162,12 +161,48 @@ async def get_status(session_id: str) -> dict[str, Any]:
     """查询工作流当前状态"""
     from backend.db.models import get_session, get_artifacts_by_session
     from backend.graph.context import get_progress_snapshot
+    from backend.trace import get_trace_by_session
     async with get_session() as db_session:
         session_data = await db_session.get_session(session_id)
         if not session_data:
             return {"error": "会话不存在", "session_id": session_id}
         artifacts = await db_session.get_artifacts_by_session(session_id)
         progress = get_progress_snapshot(session_id) or {}
+        # Worker 是独立进程，内存快照和 WebSocket 连接池无法跨进程共享。
+        # 页面重连时从已落库的 Trace 重建最新状态，保证暂停入口可见。
+        if session_data["status"] == "paused" or not progress:
+            trace = await get_trace_by_session(session_id)
+            if trace:
+                events = trace.get("events", [])
+                latest_progress = next(
+                    (event for event in reversed(events) if event["event_type"] == "progress"),
+                    None,
+                )
+                latest_wait = next(
+                    (event for event in reversed(events) if event["event_type"] == "human_waiting"),
+                    None,
+                )
+                if session_data["status"] == "paused" and latest_wait:
+                    payload = (latest_progress or {}).get("payload") or {}
+                    progress = {
+                        "event": "paused",
+                        "stage": latest_wait.get("stage"),
+                        "message": {
+                            "human_accept": "等待人工操作",
+                            "human_intervene": "等待人工介入",
+                            "human_wait": "等待复现BUG后提供日志",
+                            "intent_clarify": "等待补充研发任务槽位",
+                        }.get(latest_wait.get("stage"), "等待人工操作"),
+                        "intent": payload.get("intent"),
+                        "validation": payload.get("validation"),
+                        "token_status": payload.get("token_status"),
+                    }
+                elif latest_progress:
+                    progress = {
+                        "event": "progress",
+                        "stage": latest_progress.get("stage"),
+                        **(latest_progress.get("payload") or {}),
+                    }
         return {
             "session_id": session_data["id"],
             "type": session_data["type"],
@@ -209,8 +244,11 @@ async def get_workflow_quality(session_id: str) -> dict[str, Any]:
 
 
 async def _resume_endpoint(session_id: str, decision: str, note: str = "") -> dict[str, str]:
-    from backend.graph.context import resume_session
-    ok = resume_session(session_id, decision, feedback={"outcome": "approved" if decision == "approved" else "rejected", "note": note})
+    from backend.graph.context import queue_resume_session
+    ok = await queue_resume_session(
+        session_id, decision,
+        feedback={"outcome": "approved" if decision == "approved" else "rejected", "note": note},
+    )
     if not ok:
         return {"status": "error", "message": "无等待中的会话", "session_id": session_id}
     return {"status": "resumed", "session_id": session_id}
@@ -351,7 +389,8 @@ async def resume_workflow(req: ResumeRequest) -> dict[str, str]:
         for key, value in payload.items() if key in intent_fields
     }
     feedback = {key: value for key, value in payload.items() if key not in intent_fields}
-    ok = resume_session(session_id, req.human_decision, req.new_logs, feedback, intent_update)
+    from backend.graph.context import queue_resume_session
+    ok = await queue_resume_session(session_id, req.human_decision, req.new_logs, feedback, intent_update)
     if ok:
         return {"status": "resumed", "session_id": session_id}
     return {"status": "error", "message": "无等待中的会话", "session_id": session_id}
@@ -453,6 +492,10 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "requirement_doc": None,
             "plan": None,
             "code_changes": None,
+            "build_execution": None,
+            "fix_execution": None,
+            "build_attempt": 0,
+            "build_blocked": False,
             "implementation_note": None,
             "review_report": None,
             "review_passed": False,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any
 
 
@@ -48,6 +49,9 @@ async def push_progress(session_id: str, data: dict[str, Any]) -> None:
         from backend.trace import record_event
         await record_event("progress", data["stage"], {
             "message": data.get("stage_name") or data.get("message", ""),
+            "intent": data.get("intent"),
+            "validation": data.get("validation"),
+            "token_status": data.get("token_status"),
         })
     if session_id in _ws_connections:
         msg = json.dumps(data, ensure_ascii=False)
@@ -77,7 +81,7 @@ def get_progress_snapshot(session_id: str) -> dict[str, Any] | None:
 
 
 async def wait_for_human(session_id: str, stage: str = "human_accept") -> dict[str, Any]:
-    """等待人工操作"""
+    """等待人工操作，并通过 SQLite 控制队列支持跨进程恢复。"""
     event = asyncio.Event()
     _pause_events[session_id] = event
     from backend.db.models import update_session_status
@@ -96,7 +100,21 @@ async def wait_for_human(session_id: str, stage: str = "human_accept") -> dict[s
     from backend.trace import record_event
     await record_event("human_waiting", stage, {})
 
-    await event.wait()
+    # Worker 与 FastAPI 不共享内存，不能只等待本进程 asyncio.Event。
+    # Event 用于同进程快速唤醒，数据库轮询用于跨进程恢复。
+    while True:
+        if event.is_set():
+            # 清理 queue_resume_session 写入的共享信号，避免下一次暂停误消费旧决策。
+            await _consume_control(session_id)
+            break
+        control = await _consume_control(session_id)
+        if control is not None:
+            _human_decisions[session_id] = control
+            break
+        try:
+            await asyncio.wait_for(event.wait(), timeout=0.5)
+        except asyncio.TimeoutError:
+            continue
     _pause_events.pop(session_id, None)
     await update_session_status(session_id, "running")
     return _human_decisions.pop(session_id, {})
@@ -119,6 +137,65 @@ def resume_session(session_id: str, decision: str | None = None,
         _pause_events[session_id].set()
         return True
     return False
+
+
+async def queue_resume_session(session_id: str, decision: str | None = None,
+                               new_logs: str | None = None,
+                               feedback: dict[str, Any] | None = None,
+                               intent_update: dict[str, Any] | None = None) -> bool:
+    """将人工决策写入共享队列，并唤醒同进程等待者（若存在）。"""
+    from backend.db.models import Database
+
+    async with Database() as db:
+        row = await (await db._conn.execute(
+            "SELECT status FROM sessions WHERE id = ?", (session_id,)
+        )).fetchone()
+        if not row or row["status"] != "paused":
+            return False
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        await db._conn.execute(
+            "INSERT INTO workflow_controls "
+            "(session_id, decision, new_logs, feedback, intent_update, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET decision=excluded.decision, "
+            "new_logs=excluded.new_logs, feedback=excluded.feedback, "
+            "intent_update=excluded.intent_update, created_at=excluded.created_at",
+            (session_id, decision, new_logs, json.dumps(feedback or {}, ensure_ascii=False),
+             json.dumps(intent_update or {}, ensure_ascii=False), created_at),
+        )
+        await db._conn.commit()
+
+    # 同进程时立即唤醒；跨进程 Worker 会在轮询中消费队列。
+    if session_id in _pause_events:
+        _human_decisions[session_id] = {
+            "decision": decision,
+            "new_logs": new_logs,
+            "feedback": feedback or {},
+            "intent_update": intent_update or {},
+        }
+        _pause_events[session_id].set()
+    return True
+
+
+async def _consume_control(session_id: str) -> dict[str, Any] | None:
+    """原子读取并删除一条人工决策，避免重复恢复。"""
+    from backend.db.models import Database
+
+    async with Database() as db:
+        row = await (await db._conn.execute(
+            "SELECT decision, new_logs, feedback, intent_update FROM workflow_controls "
+            "WHERE session_id = ?", (session_id,)
+        )).fetchone()
+        if not row:
+            return None
+        await db._conn.execute("DELETE FROM workflow_controls WHERE session_id = ?", (session_id,))
+        await db._conn.commit()
+    return {
+        "decision": row["decision"],
+        "new_logs": row["new_logs"],
+        "feedback": json.loads(row["feedback"] or "{}"),
+        "intent_update": json.loads(row["intent_update"] or "{}"),
+    }
 
 
 async def _mark_session_running(session_id: str) -> None:

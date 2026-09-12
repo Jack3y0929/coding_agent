@@ -2,6 +2,8 @@
 import { computed, onMounted, ref } from 'vue'
 import TraceEventList from './TraceEventList.vue'
 
+const emit = defineEmits(['resume'])
+
 const traces = ref([])
 const selected = ref(null)
 const loading = ref(false)
@@ -15,6 +17,15 @@ function defaultForm() {
     review_effectiveness: '', diagnosis_effectiveness: '', adoption: 'all',
     fix_effectiveness: '', issue_types_text: '', note: '', preference_title: '',
     preference_content: '', preference_scope_type: 'project', preference_scope_value: '',
+  }
+}
+
+function resumeSelected() {
+  if (selected.value?.status === 'paused' && selected.value.session_id) {
+    emit('resume', {
+      session_id: selected.value.session_id,
+      workflow_type: selected.value.workflow_type,
+    })
   }
 }
 
@@ -70,7 +81,7 @@ onMounted(loadTraces)
     <div class="toolbar">
       <h2>任务 Trace</h2>
       <select v-model="filter.workflow_type" @change="loadTraces"><option value="">全部流程</option><option value="dev">DEV</option><option value="debug">DEBUG</option></select>
-      <select v-model="filter.status" @change="loadTraces"><option value="">全部状态</option><option value="running">运行中</option><option value="done">完成</option><option value="failed">失败</option></select>
+      <select v-model="filter.status" @change="loadTraces"><option value="">全部状态</option><option value="running">运行中</option><option value="paused">等待人工</option><option value="done">完成</option><option value="failed">失败</option></select>
       <button @click="loadTraces" :disabled="loading">刷新</button>
     </div>
     <p v-if="error" class="error">{{ error }}</p>
@@ -91,6 +102,10 @@ onMounted(loadTraces)
           <article><small>输入Token</small><strong>{{ selected.input_tokens ?? 0 }}</strong></article>
           <article><small>输出Token</small><strong>{{ selected.output_tokens ?? 0 }}</strong></article>
           <article><small>Trace事件</small><strong>{{ selected.events?.length ?? 0 }}</strong></article>
+        </div>
+        <div v-if="selected.status === 'paused'" class="resume-banner">
+          <span>该任务正在等待人工操作</span>
+          <button class="primary" type="button" @click="resumeSelected">打开人工介入</button>
         </div>
         <TraceEventList :events="selected.events || []" title="执行时间线" id-prefix="history" />
         <details v-if="selected.evaluations?.length"><summary>单任务质量评测（{{ selected.evaluations.length }}）</summary><div v-for="item in selected.evaluations" :key="item.metric_name" class="event"><b>{{ item.metric_name }}：{{ item.score ?? '-' }}</b><span>{{ item.source }}</span><pre>{{ JSON.stringify(item.evidence, null, 2) }}</pre></div></details>
@@ -119,4 +134,5 @@ onMounted(loadTraces)
 
 <style scoped>
 .toolbar,.grid { display:flex; gap:10px; align-items:center; flex-wrap:wrap; }.toolbar { margin-bottom:16px; }.toolbar h2 { margin-right:auto; }.toolbar select,.toolbar button,input,textarea { background:#161b22;color:#c9d1d9;border:1px solid #30363d;border-radius:6px;padding:8px; }.toolbar button,.primary { cursor:pointer; }.layout{display:grid;grid-template-columns:minmax(220px, .7fr) minmax(0,1.5fr);gap:16px}.trace-list,.detail{min-width:0}.trace-row{display:flex;width:100%;flex-direction:column;gap:4px;text-align:left;padding:10px;background:#161b22;border:1px solid #30363d;color:#c9d1d9;border-radius:6px;margin-bottom:7px;cursor:pointer}.trace-row.selected{border-color:#58a6ff}.trace-row span{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.trace-row small,.detail>p,.event span{color:#8b949e;font-size:12px}.summary-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:8px;margin:12px 0}.summary-grid article{background:#111418;border:1px solid #30363d;border-radius:7px;padding:9px}.summary-grid small{display:block;color:#8b949e;font-size:11px;margin-bottom:4px}.summary-grid strong{font-size:14px}.status-running{color:#58a6ff}.status-done{color:#3fb950}.status-failed{color:#f85149}.status-paused{color:#d29922}.detail details{border-top:1px solid #30363d;padding:10px 0}.event,.artifact{border-left:2px solid #30363d;padding:8px;margin:8px 0}.event pre,.artifact pre{white-space:pre-wrap;max-height:220px;overflow:auto;font-size:12px;color:#8b949e;margin-top:6px}.label-form{border-top:1px solid #30363d;margin-top:16px;padding-top:16px;display:flex;flex-direction:column;gap:10px}.label-form label{display:flex;flex-direction:column;gap:5px;font-size:13px;color:#8b949e}.grid>label{flex:1;min-width:140px}.primary{align-self:flex-start;background:#238636;border:0;border-radius:6px;color:white;padding:9px 16px}.error{color:#f85149}.empty{color:#8b949e;padding:24px;text-align:center;background:#161b22;border-radius:6px}@media(max-width:720px){.layout{grid-template-columns:1fr}}
+.resume-banner { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:10px 0; color:#d29922; }
 </style>
