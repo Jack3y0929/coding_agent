@@ -101,4 +101,4 @@
 }
 ```
 
-无问题时必须为 `"passed": true` 和空 findings。任一 `critical`、`high` 或 `medium` finding 必须不通过。禁止输出推理过程、完整修复代码、无证据风格偏好或与项目无关的重构建议。
+无问题时必须为 `"passed": true` 和空 findings；只要 findings 非空就必须为 `"passed": false`。任一 `critical`、`high` 或 `medium` finding 必须不通过。禁止输出推理过程、完整修复代码、无证据风格偏好或与项目无关的重构建议。

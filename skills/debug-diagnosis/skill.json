@@ -1,0 +1,12 @@
+{
+  "id": "debug-diagnosis",
+  "version": "1.0.0",
+  "name": "BUG 诊断",
+  "description": "根据代码、日志和复现信息定位根因",
+  "triggers": {"task_types": ["debug"], "stages": ["diagnose"]},
+  "allowed_tools": ["read_file", "search_code", "add_logging"],
+  "output_contract": "diagnosis_report",
+  "risk_level": "medium",
+  "priority": 100,
+  "enabled": true
+}

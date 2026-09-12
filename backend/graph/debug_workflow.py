@@ -41,6 +41,9 @@ class DebugWorkflowState(TypedDict):
     new_logs: str | None
     code_changes: dict[str, str] | None
     fix_execution: dict[str, Any] | None
+    tool_failures: list[dict[str, Any]]
+    last_tool_error: dict[str, Any] | None
+    tool_failure_exhausted: bool
     implementation_note: str | None
     review_report: str | None
     review_logic_report: str | None
@@ -132,7 +135,7 @@ async def node_diagnose(state: DebugWorkflowState) -> dict[str, Any]:
 
     try:
         result = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
-                                   state["project_path"])
+                                   state["project_path"], skill_id="debug-diagnosis")
     except BudgetExceededError:
         result = "# 问题分析报告\n\n（预算超限，诊断未完成）\n\n[论据不足]\n"
 
@@ -186,7 +189,7 @@ async def node_add_logging(state: DebugWorkflowState) -> dict[str, Any]:
 
     try:
         await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
-                          state["project_path"])
+                          state["project_path"], skill_id="debug-diagnosis")
     except BudgetExceededError:
         pass
 
@@ -241,10 +244,12 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
     messages = build_node_messages(system_prompt, user_content)
     budget = get_workflow_budget()
 
-    execution_report: dict[str, Any] = {"successful_writes": [], "failed_writes": [], "tool_calls": []}
+    execution_report: dict[str, Any] = {
+        "successful_writes": [], "failed_writes": [], "tool_calls": [], "tool_failures": [],
+    }
     try:
         result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
-                                        state["project_path"], execution_report)
+                                        state["project_path"], execution_report, skill_id="code-development")
     except BudgetExceededError:
         result_text = "## 代码变更\n\n（预算超限，修复未完成）\n\n## 实现说明\n\n修复被中断。\n"
 
@@ -277,6 +282,9 @@ async def node_fix(state: DebugWorkflowState) -> dict[str, Any]:
     return {
         "code_changes": code_changes,
         "fix_execution": execution_report,
+        "tool_failures": execution_report.get("tool_failures", []),
+        "last_tool_error": execution_report.get("last_tool_error"),
+        "tool_failure_exhausted": bool(execution_report.get("tool_failure_exhausted")),
         "implementation_note": impl_note,
         "fix_attempt": fix_attempt,
         "token_used": budget.total_input_tokens + budget.total_output_tokens,
@@ -428,7 +436,13 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
     file_count = len(code_changes)
     review_rounds = state.get("review_round", 0)
     total_tokens = state.get("token_used", 0)
-    summary_title = "# BUG修复完成" if code_changes else "# 自动化任务已停止"
+    terminal_status = "failed" if state.get("intervention_decision") == "stop" else "done"
+    summary_title = "# 任务失败" if terminal_status == "failed" else "# BUG修复完成"
+    final_state = (
+        "人工终止，任务失败" if terminal_status == "failed"
+        else "人工验收通过" if state.get("human_decision") == "approved"
+        else "审查通过"
+    )
 
     diagnosis_sufficient = state.get("diagnosis_sufficient", False)
 
@@ -439,37 +453,40 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
         f"- 总Token消耗: {total_tokens}\n"
         f"- 诊断状态: {'数据校验通过' if diagnosis_sufficient else '需人工补充日志'}\n"
         f"- 可追溯证据数: {state.get('diagnosis_evidence', {}).get('evidence_count', 0)}\n"
-        f"- 最终状态: {'审查通过' if state.get('review_passed') else '人工通过'}\n\n"
+        f"- 最终状态: {final_state}\n\n"
         f"## 变更文件\n"
         + "\n".join(f"- {fp}" for fp in code_changes.keys())
     )
 
     async with Database() as db:
-        await db.add_artifact(sid, "output_summary", summary)
+        summary_artifact_id = await db.add_artifact(sid, "output_summary", summary)
 
     from backend.artifacts import write_feedback
     write_feedback(state["document_id"], state["project_path"], summary)
 
-    # 写入长期记忆
+    # 长期记忆只保存提炼后的根因、修复和经验，完整报告保留在 artifacts/docs。
     from backend.rag.indexer import CodeIndexer
+    from backend.rag.memory_service import build_debug_memory_entries
     indexer = CodeIndexer()
-    await indexer.index_long_term_memory_entries([
-            {
-                "category": "error",
-                "title": f"BUG修复原因 - {state.get('description', '')[:50]}",
-                "content": state.get("diagnosis_report") or "",
-            },
-            {
-                "category": "error",
-                "title": f"BUG修复总结 - {state.get('description', '')[:50]}",
-                "content": summary,
-            },
-            {
-                "category": "error",
-                "title": f"BUG实现说明 - {state.get('description', '')[:50]}",
-                "content": state.get("implementation_note") or "",
-            },
-    ], source_session_id=sid, project_path=state.get("project_path", ""))
+    memory_state = {**state, "summary": summary, "source_artifact_id": summary_artifact_id}
+    # 长期记忆属于可选收尾步骤；索引故障不能否定已完成的人工验收。
+    try:
+        await indexer.index_long_term_memory_entries(
+            build_debug_memory_entries(memory_state),
+            source_session_id=sid,
+            project_path=state.get("project_path", ""),
+        )
+    except Exception as exc:
+        logger.warning("[%s] 长期记忆索引失败，保留核心工作流结果: %s", sid, exc)
+        try:
+            from backend.config import DB_PATH
+            from backend.trace import record_event
+            await record_event("memory_index_failed", "output", {
+                "error": str(exc),
+                "db_path": indexer._db_path or DB_PATH,
+            })
+        except Exception as event_exc:
+            logger.warning("[%s] 无法记录长期记忆索引失败事件: %s", sid, event_exc)
 
     if code_changes:
         changed_files = [
@@ -481,11 +498,15 @@ async def node_output_summary(state: DebugWorkflowState) -> dict[str, Any]:
         except Exception as exc:
             logger.warning(f"增量RAG更新失败: {exc}")
 
-    await push_progress(sid, {"event": "complete", "stage": "output",
-                              "message": "BUG修复完成", "summary": summary})
+    await push_progress(sid, {
+        "event": "complete" if terminal_status == "done" else "error",
+        "stage": "output",
+        "message": "BUG修复完成" if terminal_status == "done" else "人工终止自动化任务",
+        "summary": summary,
+    })
 
     logger.info(f"[{sid}] 工作流完成: {file_count}个文件变更")
-    return {"status": "done"}
+    return {"status": terminal_status}
 
 
 # ---- 条件路由 ----

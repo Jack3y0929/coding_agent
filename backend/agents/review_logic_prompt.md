@@ -107,4 +107,4 @@
 }
 ```
 
-没有问题时必须输出 `"passed": true` 和空 findings。存在 `critical`、`high` 或 `medium` finding 时必须为不通过。禁止输出推理过程、寒暄、修复代码或未经证实的猜测。
+没有问题时必须输出 `"passed": true` 和空 findings；只要 findings 非空就必须为 `"passed": false`。存在 `critical`、`high` 或 `medium` finding 时必须为不通过。禁止输出推理过程、寒暄、修复代码或未经证实的猜测。

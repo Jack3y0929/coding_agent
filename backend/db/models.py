@@ -65,7 +65,12 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 relevance_score REAL DEFAULT 0.0,
                 created_at TEXT NOT NULL,
                 last_recalled_at TEXT DEFAULT NULL
-                ,project_path TEXT NOT NULL DEFAULT ''
+                ,project_path TEXT NOT NULL DEFAULT '',
+                memory_type TEXT NOT NULL DEFAULT 'legacy',
+                source_artifact_id INTEGER DEFAULT NULL,
+                content_hash TEXT DEFAULT NULL,
+                embedding_model TEXT DEFAULT NULL,
+                embedding_dimension INTEGER DEFAULT NULL
             );
 
             CREATE TABLE IF NOT EXISTS rag_embeddings (
@@ -73,13 +78,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 source_type TEXT NOT NULL CHECK(source_type IN ('file', 'memory', 'error', 'spec')),
                 source_path TEXT NOT NULL,
                 project_path TEXT NOT NULL DEFAULT '',
-                scope_type TEXT NOT NULL DEFAULT 'project',
-                scope_key TEXT NOT NULL DEFAULT '',
                 file_hash TEXT DEFAULT NULL,
-                content_hash TEXT DEFAULT NULL,
-                embedding_model TEXT DEFAULT NULL,
-                embedding_model_version TEXT DEFAULT NULL,
-                embedding_dimension INTEGER DEFAULT NULL,
                 mtime REAL DEFAULT NULL,
                 size INTEGER DEFAULT NULL,
                 symbol TEXT DEFAULT NULL,
@@ -88,7 +87,11 @@ async def init_db(db_path: str = DB_PATH) -> None:
                 embedding BLOB DEFAULT NULL,
                 token_count INTEGER DEFAULT 0,
                 created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                memory_id INTEGER DEFAULT NULL,
+                content_hash TEXT DEFAULT NULL,
+                embedding_model TEXT DEFAULT NULL,
+                embedding_dimension INTEGER DEFAULT NULL
             );
 
             CREATE TABLE IF NOT EXISTS workflow_traces (
@@ -167,12 +170,26 @@ async def init_db(db_path: str = DB_PATH) -> None:
         """)
         await _migrate_schema(db)
         await db.commit()
+        required_tables = {
+            "sessions", "messages", "artifacts", "long_term_memory",
+            "rag_embeddings", "workflow_traces", "trace_events",
+            "trace_labels", "trace_evaluations", "workflow_controls",
+        }
+        cursor = await db.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )
+        existing_tables = {row[0] for row in await cursor.fetchall()}
+        missing_tables = sorted(required_tables - existing_tables)
+        if missing_tables:
+            raise RuntimeError(
+                f"数据库 schema 不完整，缺少表: {', '.join(missing_tables)}; "
+                f"db_path={db_path}"
+            )
         await db.executescript("""
             CREATE INDEX IF NOT EXISTS idx_rag_project_source ON rag_embeddings(project_path, source_path);
-            CREATE INDEX IF NOT EXISTS idx_rag_scope_type_key ON rag_embeddings(scope_type, scope_key, source_type);
-            CREATE INDEX IF NOT EXISTS idx_rag_content_embedding ON rag_embeddings(content_hash, embedding_model, embedding_model_version);
             CREATE INDEX IF NOT EXISTS idx_rag_type ON rag_embeddings(source_type);
             CREATE INDEX IF NOT EXISTS idx_ltm_category ON long_term_memory(category);
+            CREATE INDEX IF NOT EXISTS idx_ltm_hash_scope ON long_term_memory(content_hash, project_path, scope_type, scope_value);
             CREATE INDEX IF NOT EXISTS idx_trace_session ON workflow_traces(session_id, started_at);
             CREATE INDEX IF NOT EXISTS idx_trace_status ON workflow_traces(status, started_at);
             CREATE INDEX IF NOT EXISTS idx_trace_events_trace ON trace_events(trace_id, id);
@@ -180,7 +197,7 @@ async def init_db(db_path: str = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_trace_evaluations_trace ON trace_evaluations(trace_id, metric_name);
             CREATE INDEX IF NOT EXISTS idx_workflow_controls_created ON workflow_controls(created_at);
         """)
-    logger.info("数据库初始化完成")
+    logger.info("数据库初始化完成: %s", db_path)
 
 
 async def _migrate_schema(db: aiosqlite.Connection) -> None:
@@ -197,6 +214,11 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         "status": "TEXT NOT NULL DEFAULT 'active'",
         "supersedes_memory_id": "INTEGER DEFAULT NULL",
         "last_verified_at": "TEXT DEFAULT NULL",
+        "memory_type": "TEXT NOT NULL DEFAULT 'legacy'",
+        "source_artifact_id": "INTEGER DEFAULT NULL",
+        "content_hash": "TEXT DEFAULT NULL",
+        "embedding_model": "TEXT DEFAULT NULL",
+        "embedding_dimension": "INTEGER DEFAULT NULL",
     }
     for name, definition in migrations.items():
         if name not in columns:
@@ -209,20 +231,14 @@ async def _migrate_schema(db: aiosqlite.Connection) -> None:
         "mtime": "REAL DEFAULT NULL",
         "size": "INTEGER DEFAULT NULL",
         "symbol": "TEXT DEFAULT NULL",
-        "scope_type": "TEXT NOT NULL DEFAULT 'project'",
-        "scope_key": "TEXT NOT NULL DEFAULT ''",
+        "memory_id": "INTEGER DEFAULT NULL",
         "content_hash": "TEXT DEFAULT NULL",
         "embedding_model": "TEXT DEFAULT NULL",
-        "embedding_model_version": "TEXT DEFAULT NULL",
         "embedding_dimension": "INTEGER DEFAULT NULL",
     }
     for name, definition in rag_migrations.items():
         if name not in rag_columns:
             await db.execute(f"ALTER TABLE rag_embeddings ADD COLUMN {name} {definition}")
-    await db.execute(
-        "UPDATE rag_embeddings SET scope_type = CASE WHEN project_path = '' THEN 'global' ELSE 'project' END "
-        "WHERE scope_type = 'project' AND (scope_key = '' OR scope_key IS NULL)"
-    )
     cursor = await db.execute("PRAGMA table_info(long_term_memory)")
     memory_columns = {row[1] for row in await cursor.fetchall()}
     if "project_path" not in memory_columns:
@@ -339,14 +355,35 @@ class Database:
     async def insert_long_term_memory(self, category: str, title: str, content: str,
                                       embedding: Optional[bytes] = None,
                                       source_session_id: Optional[str] = None,
-                                      project_path: str = "") -> int:
+                                      project_path: str = "", memory_type: str = "legacy",
+                                      source_artifact_id: Optional[int] = None,
+                                      content_hash: Optional[str] = None,
+                                      embedding_model: Optional[str] = None,
+                                      embedding_dimension: Optional[int] = None,
+                                      scope_type: str = "project", scope_value: str = "") -> int:
         cursor = await self._conn.execute(
             "INSERT INTO long_term_memory (category, title, content, embedding, "
-            "source_session_id, project_path, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (category, title, content, embedding, source_session_id, project_path, _now()),
+            "source_session_id, project_path, memory_type, source_artifact_id, content_hash, "
+            "embedding_model, embedding_dimension, scope_type, scope_value, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (category, title, content, embedding, source_session_id, project_path,
+             memory_type, source_artifact_id, content_hash, embedding_model,
+             embedding_dimension, scope_type, scope_value, _now()),
         )
         await self._conn.commit()
         return cursor.lastrowid
+
+    async def get_long_term_memory_by_hash(self, content_hash: str, category: str,
+                                           project_path: str, scope_type: str,
+                                           scope_value: str) -> Optional[dict[str, Any]]:
+        cursor = await self._conn.execute(
+            "SELECT * FROM long_term_memory WHERE content_hash = ? AND category = ? "
+            "AND project_path = ? AND scope_type = ? AND scope_value = ? "
+            "AND status = 'active' ORDER BY id DESC LIMIT 1",
+            (content_hash, category, project_path, scope_type, scope_value),
+        )
+        row = await cursor.fetchone()
+        return dict(row) if row else None
 
     async def search_long_term_memory(self, keyword: str,
                                       category: Optional[str] = None,
@@ -394,20 +431,18 @@ class Database:
                                    mtime: Optional[float] = None,
                                    size: Optional[int] = None,
                                    symbol: Optional[str] = None,
-                                   scope_type: str = "project",
-                                   scope_key: str = "",
+                                   memory_id: Optional[int] = None,
                                    content_hash: Optional[str] = None,
                                    embedding_model: Optional[str] = None,
-                                   embedding_model_version: Optional[str] = None,
                                    embedding_dimension: Optional[int] = None) -> int:
         now = _now()
         cursor = await self._conn.execute(
-            "INSERT INTO rag_embeddings (source_type, source_path, project_path, scope_type, scope_key, file_hash, content_hash, "
-            "embedding_model, embedding_model_version, embedding_dimension, mtime, size, symbol, chunk_index, content, embedding, token_count, created_at, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (source_type, source_path, project_path, scope_type, scope_key, file_hash, content_hash,
-             embedding_model, embedding_model_version, embedding_dimension, mtime, size, symbol,
-             chunk_index, content, embedding, token_count, now, now),
+            "INSERT INTO rag_embeddings (source_type, source_path, project_path, file_hash, mtime, size, symbol, chunk_index, "
+            "content, embedding, token_count, created_at, updated_at, memory_id, content_hash, "
+            "embedding_model, embedding_dimension) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (source_type, source_path, project_path, file_hash, mtime, size, symbol,
+             chunk_index, content, embedding, token_count, now, now, memory_id,
+             content_hash, embedding_model, embedding_dimension),
         )
         await self._conn.commit()
         return cursor.lastrowid
@@ -431,22 +466,12 @@ class Database:
 
     async def get_rag_file_metadata(self, source_path: str, project_path: str) -> Optional[dict[str, Any]]:
         cursor = await self._conn.execute(
-            "SELECT project_path, source_path, file_hash, mtime, size, embedding_model, embedding_model_version FROM rag_embeddings "
+            "SELECT project_path, source_path, file_hash, mtime, size FROM rag_embeddings "
             "WHERE source_path = ? AND project_path = ? ORDER BY id LIMIT 1",
             (source_path, project_path),
         )
         row = await cursor.fetchone()
         return dict(row) if row else None
-
-    async def get_cached_embedding(self, content_hash: str, embedding_model: str,
-                                   embedding_model_version: str) -> Optional[bytes]:
-        cursor = await self._conn.execute(
-            "SELECT embedding FROM rag_embeddings WHERE content_hash = ? AND embedding_model = ? "
-            "AND embedding_model_version = ? AND embedding IS NOT NULL LIMIT 1",
-            (content_hash, embedding_model, embedding_model_version),
-        )
-        row = await cursor.fetchone()
-        return row[0] if row else None
 
     async def get_rag_sources(self, project_path: str, source_type: Optional[str] = "file") -> list[dict[str, Any]]:
         sql = "SELECT DISTINCT source_path, project_path, file_hash, mtime, size FROM rag_embeddings WHERE project_path = ?"
@@ -467,26 +492,13 @@ class Database:
 
     async def get_all_rag_embeddings(self,
                                      source_type: Optional[str] = None,
-                                     project_path: Optional[str] = None,
-                                     scope_types: Optional[list[str]] = None,
-                                     scope_key: str = "",
-                                     embedding_model: Optional[str] = None,
-                                     embedding_model_version: Optional[str] = None) -> list[dict[str, Any]]:
+                                     project_path: Optional[str] = None) -> list[dict[str, Any]]:
         clauses: list[str] = []
         params: list[Any] = []
         if source_type:
             clauses.append("source_type = ?"); params.append(source_type)
         if project_path is not None:
-            clauses.append("(project_path = ? OR scope_type = 'global' OR (scope_type = 'team' AND scope_key = ?))")
-            params.extend([project_path, scope_key])
-        if scope_types:
-            placeholders = ",".join("?" for _ in scope_types)
-            clauses.append(f"scope_type IN ({placeholders})")
-            params.extend(scope_types)
-        if embedding_model:
-            clauses.append("embedding_model = ?"); params.append(embedding_model)
-        if embedding_model_version:
-            clauses.append("embedding_model_version = ?"); params.append(embedding_model_version)
+            clauses.append("(project_path = ? OR project_path = '')"); params.append(project_path)
         sql = "SELECT * FROM rag_embeddings" + ((" WHERE " + " AND ".join(clauses)) if clauses else "")
         cursor = await self._conn.execute(sql, tuple(params))
         rows = await cursor.fetchall()
@@ -555,11 +567,7 @@ class Database:
     async def keyword_search_rag(self, keywords: str,
                                  source_type: Optional[str] = None,
                                  limit: int = 20,
-                                 project_path: Optional[str] = None,
-                                 scope_types: Optional[list[str]] = None,
-                                 scope_key: str = "",
-                                 embedding_model: Optional[str] = None,
-                                 embedding_model_version: Optional[str] = None) -> list[dict[str, Any]]:
+                                 project_path: Optional[str] = None) -> list[dict[str, Any]]:
         """关键词搜索 RAG 索引"""
         kw_list = [kw.strip() for kw in keywords.split() if kw.strip()]
         if not kw_list:
@@ -574,18 +582,8 @@ class Database:
             condition = f"({condition}) AND source_type = ?"
             params.append(source_type)
         if project_path is not None:
-            condition = f"({condition}) AND (project_path = ? OR scope_type = 'global' OR (scope_type = 'team' AND scope_key = ?))"
-            params.extend([project_path, scope_key])
-        if scope_types:
-            placeholders = ",".join("?" for _ in scope_types)
-            condition = f"({condition}) AND scope_type IN ({placeholders})"
-            params.extend(scope_types)
-        if embedding_model:
-            condition = f"({condition}) AND embedding_model = ?"
-            params.append(embedding_model)
-        if embedding_model_version:
-            condition = f"({condition}) AND embedding_model_version = ?"
-            params.append(embedding_model_version)
+            condition = f"({condition}) AND (project_path = ? OR project_path = '')"
+            params.append(project_path)
 
         sql = (f"SELECT * FROM rag_embeddings WHERE {condition} "
                f"ORDER BY updated_at DESC LIMIT ?")

@@ -28,6 +28,7 @@ PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH: str = os.path.join(PROJECT_ROOT, "just_codding.db")
 
 # Shell 命令白名单
+# 版本查询属于无副作用的读取操作，应允许 Agent 用于确认运行环境。
 SHELL_WHITELIST: List[str] = [
     # 只读目录与环境探测
     "dir",
@@ -45,6 +46,7 @@ SHELL_WHITELIST: List[str] = [
     "npm run build",
     "npm run lint",
     "npm run typecheck",
+    "npm --version",
     "npx tsc --noEmit",
     "pytest",
     "python -m pytest",
@@ -67,6 +69,10 @@ REVIEW_ROUNDS_DEBUG: int = 2
 
 # FC 工具循环上限
 MAX_TOOL_ROUNDS: int = 10
+# 单个工具出现可纠正错误时允许的模型纠错次数。
+MAX_TOOL_RETRIES: int = int(os.getenv("MAX_TOOL_RETRIES", "1"))
+# 连续相同调用超过此次数时提前终止，避免模型陷入重复循环。
+MAX_IDENTICAL_TOOL_CALLS: int = int(os.getenv("MAX_IDENTICAL_TOOL_CALLS", "2"))
 
 # 工具输出限制：工具结果只作为当前节点的短期工作记忆，不应无限增长。
 READ_FILE_MAX_LINES: int = 240

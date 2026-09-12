@@ -25,8 +25,11 @@ def _validate_write_path(file_path: str) -> str:
     abs_path = os.path.abspath(file_path)
     if _ALLOWED_DIRS:
         for allowed in _ALLOWED_DIRS:
-            if abs_path.startswith(allowed):
-                return abs_path
+            try:
+                if os.path.commonpath([abs_path, allowed]) == allowed:
+                    return abs_path
+            except ValueError:
+                continue
         raise PermissionError(
             f"写入路径不在允许范围内: {abs_path}。"
             f"允许的目录: {_ALLOWED_DIRS}"

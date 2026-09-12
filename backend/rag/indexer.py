@@ -6,8 +6,8 @@ import logging
 import os
 from typing import Any, Optional
 
-from backend.config import CHUNK_MAX_TOKENS
-from backend.db.models import Database
+from backend.config import CHUNK_MAX_TOKENS, DB_PATH, EMBEDDING_MODEL
+from backend.db.models import Database, init_db
 from backend.rag.embedding import get_embedding_engine
 from backend.project_scope import project_file_path, real_project_path
 
@@ -20,16 +20,6 @@ class CodeIndexer:
     def __init__(self, db_path: Optional[str] = None) -> None:
         self._engine = get_embedding_engine()
         self._db_path = db_path
-
-    def _embedding_metadata(self) -> tuple[str, str, int]:
-        """兼容测试替身和旧 EmbeddingEngine，统一取得向量元数据。"""
-        model = str(getattr(self._engine, "model_name", "legacy"))
-        version = str(getattr(self._engine, "model_version", "legacy"))
-        if hasattr(self._engine, "dimension"):
-            dimension = int(getattr(self._engine, "dimension", 0) or 0)
-        else:
-            dimension = 384
-        return model, version, dimension
 
     async def _trace(self, event_type: str, payload: dict[str, Any]) -> None:
         try:
@@ -121,28 +111,9 @@ class CodeIndexer:
                 "token_count": self._estimate_tokens(source),
             }]
 
-        # 优先复用同模型、同版本、同内容的向量，避免跨项目重复计算。
+        # 批量向量化
         texts = [chunk["content"] for chunk in chunks]
-        model_name, model_version, model_dimension = self._embedding_metadata()
-        embeddings_bytes: list[bytes] = []
-        missing: list[int] = []
-        for index, text in enumerate(texts):
-            content_hash = hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()
-            cached = await db.get_cached_embedding(
-                content_hash, model_name, model_version,
-            )
-            if cached is None:
-                embeddings_bytes.append(b"")
-                missing.append(index)
-            else:
-                embeddings_bytes.append(cached)
-        if missing:
-            generated = self._engine.batch_encode_to_bytes([texts[index] for index in missing])
-            for index, embedding in zip(missing, generated):
-                embeddings_bytes[index] = embedding
-        model_name, model_version, model_dimension = self._embedding_metadata()
-        if model_dimension <= 0 and embeddings_bytes:
-            model_dimension = len(embeddings_bytes[0]) // 4
+        embeddings_bytes = self._engine.batch_encode_to_bytes(texts)
 
         try:
             # 删除旧索引
@@ -151,7 +122,6 @@ class CodeIndexer:
 
             # 写入新索引
             for chunk, emb_bytes in zip(chunks, embeddings_bytes):
-                content_hash = hashlib.sha256(chunk["content"].encode("utf-8", errors="replace")).hexdigest()
                 await db.insert_rag_embedding(
                     source_type="file",
                     source_path=rel_path,
@@ -161,11 +131,6 @@ class CodeIndexer:
                     token_count=chunk["token_count"],
                     project_path=root, file_hash=file_hash, mtime=stat.st_mtime,
                     size=stat.st_size, symbol=chunk.get("symbol"),
-                    scope_type="project", scope_key=root,
-                    content_hash=content_hash,
-                    embedding_model=model_name,
-                    embedding_model_version=model_version,
-                    embedding_dimension=model_dimension,
                 )
             await self._trace("file_reindexed" if had_old else "file_indexed", {
                 "project_path": root, "source_path": rel_path, "file_hash": file_hash,
@@ -201,12 +166,7 @@ class CodeIndexer:
         chunks = [part.strip() for part in source.split("\n\n") if part.strip()]
         if not chunks:
             chunks = [source]
-        embeddings: list[bytes] = []
-        for content in chunks:
-            content_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
-            model_name, model_version, model_dimension = self._embedding_metadata()
-            cached = await db.get_cached_embedding(content_hash, model_name, model_version)
-            embeddings.append(cached or self._engine.encode_to_bytes(content))
+        embeddings = self._engine.batch_encode_to_bytes(chunks)
         close_db = False
         if db is None:
             db = Database()
@@ -215,12 +175,9 @@ class CodeIndexer:
         try:
             await db.delete_rag_by_source(rel_path, root)
             for index, (content, embedding) in enumerate(zip(chunks, embeddings)):
-                content_hash = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()
                 await db.insert_rag_embedding("memory", rel_path, index, content, embedding,
                                               self._estimate_tokens(content), root, file_hash,
-                                              stat.st_mtime, stat.st_size, None,
-                                              "project", root, content_hash,
-                                              model_name, model_version, model_dimension)
+                                              stat.st_mtime, stat.st_size, None)
             await self._trace("file_reindexed" if metadata else "file_indexed", {
                 "project_path": root, "source_path": rel_path, "file_hash": file_hash,
                 "chunks": len(chunks),
@@ -354,11 +311,26 @@ class CodeIndexer:
                                      content: str,
                                      source_session_id: str = "",
                                      project_path: str = "",
+                                     memory_type: str = "lesson",
+                                     source_artifact_id: Optional[int] = None,
                                      scope_type: str = "project",
-                                     scope_key: str = "") -> int:
-        """将任务总结/错误模式写入长期记忆并向量化"""
+                                     scope_value: str = "") -> int:
+        """将提炼后的长期记忆去重后写入并向量化。"""
+        content = content.strip()
+        content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        # Worker 可能独立于 API 进程启动；写入前再次幂等确认 schema。
+        await init_db(self._db_path or DB_PATH)
+        async with Database(self._db_path) as db:
+            existing = await db.get_long_term_memory_by_hash(
+                content_hash, category, project_path, scope_type, scope_value,
+            )
+            if existing:
+                return int(existing["id"])
+
         embedding_bytes = self._engine.encode_to_bytes(content)
-        model_name, model_version, model_dimension = self._embedding_metadata()
+        embedding_dimension = getattr(self._engine, "dimension", None)
+        if embedding_dimension is None:
+            embedding_dimension = len(embedding_bytes) // 4
 
         async with Database(self._db_path) as db:
             memory_id = await db.insert_long_term_memory(
@@ -368,6 +340,13 @@ class CodeIndexer:
                 embedding=embedding_bytes,
                 source_session_id=source_session_id,
                 project_path=project_path,
+                memory_type=memory_type,
+                source_artifact_id=source_artifact_id,
+                content_hash=content_hash,
+                embedding_model=EMBEDDING_MODEL,
+                embedding_dimension=embedding_dimension,
+                scope_type=scope_type,
+                scope_value=scope_value,
             )
 
             # 同时写入 rag_embeddings 表以便统一检索
@@ -379,13 +358,11 @@ class CodeIndexer:
                 content=content,
                 embedding=embedding_bytes,
                 token_count=self._estimate_tokens(content),
-                content_hash=hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest(),
-                embedding_model=model_name,
-                embedding_model_version=model_version,
-                embedding_dimension=model_dimension,
-                scope_type=scope_type,
-                scope_key=scope_key or project_path,
                 project_path=project_path,
+                memory_id=memory_id,
+                content_hash=content_hash,
+                embedding_model=EMBEDDING_MODEL,
+                embedding_dimension=embedding_dimension,
             )
 
         logger.info(f"长期记忆写入: [{category}] {title}")
@@ -409,8 +386,10 @@ class CodeIndexer:
                 content=content,
                 source_session_id=source_session_id,
                 project_path=project_path,
+                memory_type=entry.get("memory_type", "lesson"),
+                source_artifact_id=entry.get("source_artifact_id"),
                 scope_type=entry.get("scope_type", "project"),
-                scope_key=entry.get("scope_key", project_path),
+                scope_value=entry.get("scope_value", ""),
             )
             memory_ids.append(memory_id)
         return memory_ids

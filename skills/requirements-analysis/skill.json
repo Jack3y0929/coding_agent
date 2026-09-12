@@ -1,0 +1,12 @@
+{
+  "id": "requirements-analysis",
+  "version": "1.0.0",
+  "name": "需求分析",
+  "description": "将澄清文档整理为可执行的需求概括",
+  "triggers": {"task_types": ["dev", "refactor"], "stages": ["analyze"]},
+  "allowed_tools": ["read_file", "search_code", "save_checkpoint"],
+  "output_contract": "requirement_summary",
+  "risk_level": "low",
+  "priority": 80,
+  "enabled": true
+}

@@ -20,6 +20,11 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [worker] %(levelname
 logger = logging.getLogger("worker")
 
 
+def resolve_task_status(session_status: str | None) -> str:
+    """Worker 只接受数据库中的明确终态，未知状态不得默认成功。"""
+    return session_status if session_status in {"done", "failed"} else "failed"
+
+
 async def _run(task_path: Path) -> None:
     payload = json.loads(task_path.read_text(encoding="utf-8"))
     payload.update({"pid": os.getpid(), "status": "running", "heartbeat_at": datetime.now(timezone.utc).isoformat()})
@@ -36,7 +41,15 @@ def main() -> int:
     try:
         asyncio.run(_run(task_path))
         payload = json.loads(task_path.read_text(encoding="utf-8")) if task_path.exists() else {}
-        payload.update({"status": "done", "finished_at": datetime.now(timezone.utc).isoformat()})
+        from backend.db.models import Database
+
+        async def read_final_status() -> str:
+            async with Database() as db:
+                session = await db.get_session(payload["session_id"])
+            return resolve_task_status(session["status"] if session else None)
+
+        final_status = asyncio.run(read_final_status())
+        payload.update({"status": final_status, "finished_at": datetime.now(timezone.utc).isoformat()})
         task_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         return 0
     except Exception:

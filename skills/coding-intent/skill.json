@@ -1,0 +1,12 @@
+{
+  "id": "coding-intent",
+  "version": "1.0.0",
+  "name": "研发意图提取",
+  "description": "从用户描述提取任务类型、范围、约束和验收槽位",
+  "triggers": {"task_types": [], "stages": ["intent"]},
+  "allowed_tools": [],
+  "output_contract": "coding_intent",
+  "risk_level": "low",
+  "priority": 100,
+  "enabled": true
+}

@@ -38,14 +38,14 @@ def _build_metrics(events: list[dict[str, Any]], label: dict[str, Any] | None) -
     tool_calls = [item for item in events if item["event_type"] == "tool_call"]
     tool_failures = [item for item in events if item["event_type"] in {"tool_call_failed", "write_scope_blocked"}]
     validations = [item for item in events if item["event_type"] == "validation_result"]
-    review_outputs = [item for item in events if item["event_type"] == "stage_output" and item["stage"] == "review"]
+    review_outputs = [item for item in events if item["event_type"] == "review_aggregated"]
     slot_checks = [item for item in events if item["event_type"] == "slot_validation"]
     clarified = "clarification_requested" in event_types
 
     validation_passed = bool(validations) and all(
         bool(item["payload"].get("passed")) for item in validations
     )
-    review_passed = any("[审查通过]" in item["payload"].get("output", "") for item in review_outputs)
+    review_passed = bool(review_outputs) and bool(review_outputs[-1]["payload"].get("passed"))
     scope_blocks = sum(item["event_type"] == "write_scope_blocked" for item in events)
     scores = [
         _metric("intent_slot_completion", 0.0 if clarified else 1.0, "rule", {

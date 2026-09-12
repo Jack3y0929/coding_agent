@@ -252,7 +252,9 @@ async function restoreStatus() {
     const progress = data.progress || {}
     if (progress.stage || progress.event) handleProgress(progress)
     if (data.status === 'done') handleProgress({ event: 'complete', stage: 'output' })
-    if (data.status === 'failed') handleProgress({ event: 'error', message: '工作流执行失败' })
+    if (data.status === 'failed') {
+      handleProgress({ event: 'error', message: data.error_message || '工作流执行失败' })
+    }
     if (data.type) currentWorkflowType.value = data.type
   } catch (error) {
     console.warn('恢复工作流状态失败:', error)

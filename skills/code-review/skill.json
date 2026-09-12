@@ -1,0 +1,12 @@
+{
+  "id": "code-review",
+  "version": "1.0.0",
+  "name": "代码审查",
+  "description": "从逻辑、安全和工程质量角度审查代码变更",
+  "triggers": {"task_types": ["dev", "refactor", "debug"], "stages": ["review"]},
+  "allowed_tools": ["read_file", "search_code"],
+  "output_contract": "review_report",
+  "risk_level": "medium",
+  "priority": 70,
+  "enabled": true
+}

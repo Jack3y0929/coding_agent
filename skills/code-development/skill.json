@@ -1,0 +1,12 @@
+{
+  "id": "code-development",
+  "version": "1.0.0",
+  "name": "代码开发",
+  "description": "按需求和方案实施受约束的代码变更",
+  "triggers": {"task_types": ["dev", "refactor", "debug"], "stages": ["develop_plan", "develop_build", "fix"]},
+  "allowed_tools": ["read_file", "search_code", "save_checkpoint", "write_file", "execute_shell"],
+  "output_contract": "code_changes",
+  "risk_level": "high",
+  "priority": 90,
+  "enabled": true
+}

@@ -174,6 +174,53 @@ async def recover_stale_sessions(max_age_minutes: int = 30) -> int:
         return int(cursor.rowcount or 0)
 
 
+async def repair_legacy_terminal_statuses() -> int:
+    """校正旧版本将人工 stop 错记为 done 的 Trace，保留原事件并追加失败事件。"""
+    async with Database() as db:
+        rows = await (await db._conn.execute(
+            "SELECT t.trace_id, t.session_id, e.payload "
+            "FROM workflow_traces t "
+            "JOIN trace_events e ON e.trace_id = t.trace_id "
+            "WHERE t.status = 'done' AND e.event_type = 'human_intervention'"
+        )).fetchall()
+        repaired: set[str] = set()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if payload.get("decision") != "stop" or row["trace_id"] in repaired:
+                continue
+            error_message = "人工终止自动化任务（历史终态已校正）"
+            await db._conn.execute(
+                "UPDATE workflow_traces SET status = 'failed', error_message = ? "
+                "WHERE trace_id = ?",
+                (error_message, row["trace_id"]),
+            )
+            await db._conn.execute(
+                "UPDATE sessions SET status = 'failed' WHERE id = ? AND status = 'done'",
+                (row["session_id"],),
+            )
+            await db._conn.execute(
+                "INSERT INTO trace_events "
+                "(trace_id, event_type, stage, payload, created_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    row["trace_id"],
+                    "workflow_failed",
+                    "output",
+                    _json({
+                        "status": "failed",
+                        "error": error_message,
+                        "reason_code": "legacy_terminal_status_repaired",
+                    }),
+                    _now(),
+                ),
+            )
+            repaired.add(row["trace_id"])
+        await db._conn.commit()
+    return len(repaired)
+
+
 async def update_trace_workflow_type(trace_id: str, workflow_type: str) -> None:
     """在自动识别或澄清后记录最终实际执行的工作流类型。"""
     async with Database() as db:
@@ -466,10 +513,12 @@ async def _review_pass_rate(trace_ids: list[str]) -> Optional[float]:
     placeholders = ",".join("?" for _ in trace_ids)
     async with Database() as db:
         rows = await (await db._conn.execute(
-            f"SELECT payload FROM trace_events WHERE trace_id IN ({placeholders}) "
-            "AND event_type = 'stage_output' AND stage = 'review'", tuple(trace_ids)
+            f"SELECT trace_id, payload FROM trace_events WHERE trace_id IN ({placeholders}) "
+            "AND event_type = 'review_aggregated' ORDER BY id", tuple(trace_ids)
         )).fetchall()
     if not rows:
         return None
-    passed = sum("[审查通过]" in json.loads(row["payload"]).get("output", "") for row in rows)
-    return _ratio(passed, len(rows))
+    latest_by_trace: dict[str, bool] = {}
+    for row in rows:
+        latest_by_trace[row["trace_id"]] = bool(json.loads(row["payload"]).get("passed"))
+    return _ratio(sum(latest_by_trace.values()), len(latest_by_trace))

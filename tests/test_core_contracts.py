@@ -34,6 +34,7 @@ def test_intent_rules_clarify_incomplete_debug_task() -> None:
 
 def test_cosine_and_rrf_are_deterministic() -> None:
     assert cosine_similarity(np.array([1.0, 0.0]), np.array([1.0, 0.0])) == pytest.approx(1.0)
+    assert cosine_similarity(np.array([1.0, 0.0]), np.array([1.0, 0.0, 0.0])) == 0.0
     keyword = [{"id": 1, "content": "a"}, {"id": 2, "content": "b"}]
     semantic = [{"id": 2, "content": "b"}, {"id": 3, "content": "c"}]
     result = rrf_fusion(keyword, semantic, k=1)

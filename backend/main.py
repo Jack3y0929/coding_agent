@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import uuid
 import subprocess
 import sys
@@ -20,9 +21,26 @@ from backend.graph.context import (
     register_ws,
     unregister_ws,
 )
+from backend.graph.nodes import FC_TOOLS
+from backend.skills.registry import get_skill_registry, initialize_skill_registry
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
 logger = logging.getLogger("main")
+
+
+def resolve_terminal_status(
+    candidate_status: str | None,
+    budget_interrupted: bool = False,
+) -> tuple[str, str | None]:
+    """仅接受 output 节点的明确状态，避免工作流提前结束时误报成功。"""
+    if budget_interrupted:
+        return "failed", "Token 预算超限，工作流未完成"
+    if candidate_status == "done":
+        return "done", None
+    if candidate_status == "failed":
+        return "failed", "人工终止自动化任务"
+    return "failed", "工作流未产生明确成功终态"
+
 
 app = FastAPI(title="Just_codding")
 
@@ -33,16 +51,24 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 async def startup_event() -> None:
     """初始化数据库并回收服务重启后遗留的工作流。"""
     from backend.db.models import init_db
-    from backend.trace import recover_stale_traces, recover_stale_sessions
+    from backend.trace import (
+        recover_stale_traces,
+        recover_stale_sessions,
+        repair_legacy_terminal_statuses,
+    )
 
     await init_db()
+    initialize_skill_registry({item["function"]["name"] for item in FC_TOOLS})
     await recover_orphan_workflows()
     recovered = await recover_stale_traces()
     recovered_sessions = await recover_stale_sessions()
+    repaired_legacy = await repair_legacy_terminal_statuses()
     if recovered:
         logger.warning("启动时回收 %s 个陈旧 Trace", recovered)
     if recovered_sessions:
         logger.warning("启动时回收 %s 个陈旧会话", recovered_sessions)
+    if repaired_legacy:
+        logger.warning("启动时校正 %s 个历史人工终止 Trace", repaired_legacy)
 
 
 async def recover_orphan_workflows() -> int:
@@ -130,6 +156,52 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+class SkillToggleRequest(BaseModel):
+    enabled: bool
+
+
+class SkillRegisterRequest(BaseModel):
+    skill_id: str
+
+
+@app.get("/api/skills")
+async def list_skills() -> list[dict[str, object]]:
+    """返回当前已加载的 Skill 及其版本、权限和状态。"""
+    initialize_skill_registry({item["function"]["name"] for item in FC_TOOLS})
+    return get_skill_registry().list()
+
+
+@app.post("/api/skills/register")
+async def register_skill(req: SkillRegisterRequest) -> dict[str, object]:
+    """从项目 skills 目录注册一个 Skill，不接受任意系统路径。"""
+    initialize_skill_registry({item["function"]["name"] for item in FC_TOOLS})
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{1,63}", req.skill_id):
+        raise HTTPException(status_code=400, detail="Skill ID 格式无效")
+    root = (Path(PROJECT_ROOT) / "skills").resolve()
+    candidate = (root / req.skill_id).resolve()
+    if candidate.parent != root:
+        raise HTTPException(status_code=400, detail="Skill 路径无效")
+    if not candidate.is_dir():
+        raise HTTPException(status_code=404, detail=f"Skill 目录不存在: {req.skill_id}")
+    try:
+        skill = get_skill_registry().register_from(
+            candidate, {item["function"]["name"] for item in FC_TOOLS}
+        )
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail=f"Skill 校验失败: {exc}") from exc
+    return skill.as_dict()
+
+
+@app.post("/api/skills/{skill_id}/enabled")
+async def toggle_skill(skill_id: str, req: SkillToggleRequest) -> dict[str, object]:
+    """启用或禁用已加载 Skill；状态在当前进程内立即生效。"""
+    initialize_skill_registry({item["function"]["name"] for item in FC_TOOLS})
+    registry = get_skill_registry()
+    if not registry.set_enabled(skill_id, req.enabled):
+        raise HTTPException(status_code=404, detail=f"Skill 不存在: {skill_id}")
+    return {"skill_id": skill_id, "enabled": req.enabled}
+
+
 @app.post("/api/workflow/run")
 async def start_workflow(req: StartWorkflowRequest) -> dict[str, Any]:
     """启动一个新工作流"""
@@ -168,11 +240,13 @@ async def get_status(session_id: str) -> dict[str, Any]:
             return {"error": "会话不存在", "session_id": session_id}
         artifacts = await db_session.get_artifacts_by_session(session_id)
         progress = get_progress_snapshot(session_id) or {}
+        trace_error: str | None = None
         # Worker 是独立进程，内存快照和 WebSocket 连接池无法跨进程共享。
         # 页面重连时从已落库的 Trace 重建最新状态，保证暂停入口可见。
-        if session_data["status"] == "paused" or not progress:
+        if session_data["status"] in {"paused", "failed"} or not progress:
             trace = await get_trace_by_session(session_id)
             if trace:
+                trace_error = trace.get("error_message")
                 events = trace.get("events", [])
                 latest_progress = next(
                     (event for event in reversed(events) if event["event_type"] == "progress"),
@@ -207,6 +281,7 @@ async def get_status(session_id: str) -> dict[str, Any]:
             "session_id": session_data["id"],
             "type": session_data["type"],
             "status": session_data["status"],
+            "error_message": trace_error,
             "created_at": session_data["created_at"],
             "artifacts": [
                 {"type": a["type"], "created_at": a["created_at"]}
@@ -422,6 +497,8 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
     budget = TokenBudget()
     trace_token = None
     intent_token = None
+    # 只有 output 节点明确返回 done 才允许成功，避免图提前结束时静默报成功。
+    terminal_status, terminal_error = resolve_terminal_status(None)
     budget_token = bind_budget(budget)
     try:
         req = req.model_copy(update={"project_path": real_project_path(req.project_path)})
@@ -494,6 +571,9 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "code_changes": None,
             "build_execution": None,
             "fix_execution": None,
+            "tool_failures": [],
+            "last_tool_error": None,
+            "tool_failure_exhausted": False,
             "build_attempt": 0,
             "build_blocked": False,
             "implementation_note": None,
@@ -510,6 +590,7 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             "human_decision": None,
             "intervention_decision": None,
             "validation_passed": None,
+            "validation_result": None,
             "session_id": session_id,
             "project_path": req.project_path,
             "description": req.description,
@@ -524,14 +605,22 @@ async def run_workflow_async(session_id: str, req: StartWorkflowRequest) -> None
             for node_name, node_output in event.items():
                 if node_output is not None:
                     await record_stage_output(node_name, node_output)
+                    if node_name == "output" and isinstance(node_output, dict):
+                        candidate_status = node_output.get("status")
+                        if candidate_status in {"done", "failed"}:
+                            terminal_status, terminal_error = resolve_terminal_status(candidate_status)
 
-        await update_session_status(session_id, "done")
-        await finish_trace("done", budget.get_status())
+        terminal_status, terminal_error = resolve_terminal_status(
+            terminal_status,
+            budget_interrupted=budget.interrupted,
+        )
+        await update_session_status(session_id, terminal_status)
+        await finish_trace(terminal_status, budget.get_status(), terminal_error)
         from backend.evaluation.service import evaluate_trace
         await evaluate_trace(trace_id)
         await push_progress(session_id, {
-            "event": "complete",
-            "message": "工作流执行完成",
+            "event": "complete" if terminal_status == "done" else "error",
+            "message": "工作流执行完成" if terminal_status == "done" else terminal_error,
             "token_status": budget.get_status(),
         })
 

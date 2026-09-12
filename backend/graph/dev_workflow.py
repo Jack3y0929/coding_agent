@@ -14,7 +14,9 @@ from backend.config import MAX_FIX_ATTEMPTS, PROJECT_ROOT
 from backend.db.models import Database
 from backend.graph.context import push_progress, wait_for_human
 from backend.graph.nodes import (
+    BUILD_REACT_POLICY,
     PLAN_MODE_TOOLS,
+    PLAN_REACT_POLICY,
     BUILD_MODE_TOOLS,
     build_node_messages,
     inject_rag_context,
@@ -40,6 +42,9 @@ class DevWorkflowState(TypedDict):
     code_changes: dict[str, str] | None
     build_execution: dict[str, Any] | None
     fix_execution: dict[str, Any] | None
+    tool_failures: list[dict[str, Any]]
+    last_tool_error: dict[str, Any] | None
+    tool_failure_exhausted: bool
     build_attempt: int
     build_blocked: bool
     implementation_note: str | None
@@ -63,6 +68,7 @@ class DevWorkflowState(TypedDict):
     human_decision: str | None
     intervention_decision: str | None
     validation_passed: bool | None
+    validation_result: dict[str, Any] | None
     session_id: str
     project_path: str
     description: str
@@ -126,7 +132,7 @@ async def node_analyze(state: DevWorkflowState) -> dict[str, Any]:
 
     try:
         result = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
-                                   state["project_path"])
+                                   state["project_path"], skill_id="requirements-analysis")
     except BudgetExceededError:
         result = "# 需求概括文档\n\n（预算超限，分析未完成）\n"
 
@@ -149,6 +155,8 @@ async def node_develop_plan(state: DevWorkflowState) -> dict[str, Any]:
     system_prompt = load_system_prompt("developer") + (
         "\n\n当前处于 **Plan 模式**。你只能使用 read_file 和 search_code 工具分析代码。"
         "严禁写文件或执行修改性命令。"
+        "\n采用有限轮次的行动-观察循环：先读取或搜索证据，再根据工具结果决定下一步。"
+        "不要重复完全相同的调用，不要输出隐藏思维链。"
         "\n制定完备的实现方案后，调用 save_checkpoint 工具请求切换到 Build 模式。"
     )
     rag_ctx = await inject_rag_context("developer", state["requirement_doc"] or "", state["project_path"])
@@ -166,8 +174,16 @@ async def node_develop_plan(state: DevWorkflowState) -> dict[str, Any]:
     budget = get_workflow_budget()
 
     try:
-        plan = await run_fc_loop(messages, PLAN_MODE_TOOLS, budget, "plan",
-                                 state["project_path"])
+        plan = await run_fc_loop(
+            messages,
+            PLAN_MODE_TOOLS,
+            budget,
+            "plan",
+            state["project_path"],
+            skill_id="code-development",
+            react_enabled=True,
+            react_policy=PLAN_REACT_POLICY,
+        )
     except BudgetExceededError:
         plan = "# 开发方案\n\n（预算超限，规划未完成）\n"
 
@@ -191,6 +207,8 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
     system_prompt = load_system_prompt("developer") + (
         f"\n\n当前处于 **Build 模式**。Plan 方案：\n{state.get('plan', '(无Plan)')}\n"
         "你可以使用全部工具（write_file、execute_shell等），但必须遵循安全校验。"
+        "\n采用有限轮次的行动-观察循环：写入后继续执行验证，根据验证结果决定是否修复。"
+        "不要重复完全相同的调用，不要输出隐藏思维链。"
         "\n完成后在回复末尾用清晰标记注明代码变更和实现说明。"
     )
 
@@ -205,16 +223,27 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
     messages = build_node_messages(system_prompt, user_content)
     budget = get_workflow_budget()
 
-    execution_report: dict[str, Any] = {"successful_writes": [], "failed_writes": [], "tool_calls": []}
+    execution_report: dict[str, Any] = {
+        "successful_writes": [], "failed_writes": [], "tool_calls": [], "tool_failures": [],
+    }
     try:
-        result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
-                                        state["project_path"], execution_report)
+        result_text = await run_fc_loop(
+            messages,
+            BUILD_MODE_TOOLS,
+            budget,
+            "build",
+            state["project_path"],
+            execution_report,
+            skill_id="code-development",
+            react_enabled=True,
+            react_policy=BUILD_REACT_POLICY,
+        )
     except BudgetExceededError:
         result_text = "## 代码变更\n\n（预算超限，开发未完成）\n\n## 实现说明\n\n开发被中断。\n"
 
     # 代码变更只来自真实成功的 write_file，不再把模型说明伪装成 output.txt。
     code_changes = dict(state.get("code_changes") or {})
-    code_changes.update(_changes_from_execution(execution_report))
+    code_changes.update(_changes_from_execution(execution_report, state["project_path"]))
     impl_note = _parse_implementation_note(result_text)
     build_attempt = state.get("build_attempt", 0) + 1
     build_blocked = not execution_report.get("successful_writes")
@@ -253,6 +282,9 @@ async def node_develop_build(state: DevWorkflowState) -> dict[str, Any]:
         "code_changes": code_changes,
         "implementation_note": impl_note,
         "build_execution": execution_report,
+        "tool_failures": execution_report.get("tool_failures", []),
+        "last_tool_error": execution_report.get("last_tool_error"),
+        "tool_failure_exhausted": bool(execution_report.get("tool_failure_exhausted")),
         "build_attempt": build_attempt,
         "build_blocked": build_blocked,
         "token_used": budget.total_input_tokens + budget.total_output_tokens,
@@ -328,7 +360,7 @@ async def node_validate(state: DevWorkflowState) -> dict[str, Any]:
         from backend.fallback.engine import after_validation
         from backend.trace import record_fallback_decision
         await record_fallback_decision(after_validation(True, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS), "validate")
-        return {"validation_passed": True}
+        return {"validation_passed": True, "validation_result": checks}
     await push_progress(sid, {"event": "progress", "stage": "validate", "message": "执行验证命令中..."})
     results = [await execute_shell(command, cwd=state["project_path"]) for command in commands]
     passed = checks["passed"] and all("[exit_code: 0]" in result for result in results)
@@ -339,7 +371,13 @@ async def node_validate(state: DevWorkflowState) -> dict[str, Any]:
     from backend.fallback.engine import after_validation
     from backend.trace import record_fallback_decision
     await record_fallback_decision(after_validation(passed, state.get("fix_attempt", 0), MAX_FIX_ATTEMPTS), "validate")
-    return {"validation_passed": passed}
+    validation_result = {
+        "passed": passed,
+        "artifact_checks": checks,
+        "commands": commands,
+        "results": [result[:1000] for result in results],
+    }
+    return {"validation_passed": passed, "validation_result": validation_result}
 
 
 def _validate_dev_artifacts(state: DevWorkflowState, intent: Any) -> dict[str, Any]:
@@ -407,15 +445,17 @@ async def node_fix(state: DevWorkflowState) -> dict[str, Any]:
     messages = build_node_messages(system_prompt, user_content)
     budget = get_workflow_budget()
 
-    execution_report: dict[str, Any] = {"successful_writes": [], "failed_writes": [], "tool_calls": []}
+    execution_report: dict[str, Any] = {
+        "successful_writes": [], "failed_writes": [], "tool_calls": [], "tool_failures": [],
+    }
     try:
         result_text = await run_fc_loop(messages, BUILD_MODE_TOOLS, budget, "build",
-                                        state["project_path"], execution_report)
+                                        state["project_path"], execution_report, skill_id="code-development")
     except BudgetExceededError:
         result_text = "## 代码变更\n\n（预算超限，修复未完成）\n\n## 实现说明\n\n修复被中断。\n"
 
     code_changes = dict(state.get("code_changes") or {})
-    code_changes.update(_changes_from_execution(execution_report))
+    code_changes.update(_changes_from_execution(execution_report, state["project_path"]))
     impl_note = _parse_implementation_note(result_text)
     from backend.trace import record_event
     from backend.fallback.engine import after_build
@@ -440,6 +480,9 @@ async def node_fix(state: DevWorkflowState) -> dict[str, Any]:
         "code_changes": code_changes,
         "implementation_note": impl_note,
         "fix_execution": execution_report,
+        "tool_failures": execution_report.get("tool_failures", []),
+        "last_tool_error": execution_report.get("last_tool_error"),
+        "tool_failure_exhausted": bool(execution_report.get("tool_failure_exhausted")),
         "fix_attempt": fix_attempt,
         "token_used": budget.total_input_tokens + budget.total_output_tokens,
     }
@@ -506,49 +549,53 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
     file_count = len(code_changes)
     review_rounds = state.get("review_round", 0)
     total_tokens = state.get("token_used", 0)
-    summary_title = "# 开发完成" if code_changes else "# 自动化任务已停止"
+    terminal_status = "failed" if state.get("intervention_decision") == "stop" else "done"
+    summary_title = "# 任务失败" if terminal_status == "failed" else "# 开发完成"
+    final_state = (
+        "人工终止，任务失败" if terminal_status == "failed"
+        else "人工验收通过" if state.get("human_decision") == "approved"
+        else "审查通过"
+    )
 
     summary = (
         f"{summary_title}\n\n"
         f"- 变更文件数: {file_count}\n"
         f"- 审查轮次: {review_rounds}\n"
         f"- 总Token消耗: {total_tokens}\n"
-        f"- 最终状态: {'审查通过' if state.get('review_passed') else '人工通过'}\n\n"
+        f"- 最终状态: {final_state}\n\n"
         f"## 变更文件\n"
         + "\n".join(f"- {fp}" for fp in code_changes.keys())
     )
 
     async with Database() as db:
-        await db.add_artifact(sid, "output_summary", summary)
+        summary_artifact_id = await db.add_artifact(sid, "output_summary", summary)
 
     from backend.artifacts import write_feedback
     write_feedback(state["document_id"], state["project_path"], summary)
 
-    # 写入长期记忆
+    # 长期记忆只保存提炼后的结果和经验，完整原文保留在 artifacts/docs。
     from backend.rag.indexer import CodeIndexer
+    from backend.rag.memory_service import build_dev_memory_entries
     indexer = CodeIndexer()
-    await indexer.index_long_term_memory_entries([
-            {
-                "category": "task",
-                "title": f"DEV任务 - {state.get('description', '')[:50]}",
-                "content": summary,
-            },
-            {
-                "category": "task",
-                "title": f"DEV需求 - {state.get('description', '')[:50]}",
-                "content": state.get("requirement_doc") or "",
-            },
-            {
-                "category": "task",
-                "title": f"DEV开发计划 - {state.get('description', '')[:50]}",
-                "content": state.get("plan") or "",
-            },
-            {
-                "category": "task",
-                "title": f"DEV实现说明 - {state.get('description', '')[:50]}",
-                "content": state.get("implementation_note") or "",
-            },
-    ], source_session_id=sid, project_path=state.get("project_path", ""))
+    memory_state = {**state, "summary": summary, "source_artifact_id": summary_artifact_id}
+    # 长期记忆属于可选收尾步骤；索引故障不能否定已完成的人工验收。
+    try:
+        await indexer.index_long_term_memory_entries(
+            build_dev_memory_entries(memory_state),
+            source_session_id=sid,
+            project_path=state.get("project_path", ""),
+        )
+    except Exception as exc:
+        logger.warning("[%s] 长期记忆索引失败，保留核心工作流结果: %s", sid, exc)
+        try:
+            from backend.config import DB_PATH
+            from backend.trace import record_event
+            await record_event("memory_index_failed", "output", {
+                "error": str(exc),
+                "db_path": indexer._db_path or DB_PATH,
+            })
+        except Exception as event_exc:
+            logger.warning("[%s] 无法记录长期记忆索引失败事件: %s", sid, event_exc)
 
     # 增量更新RAG索引
     if code_changes:
@@ -561,11 +608,15 @@ async def node_output_summary(state: DevWorkflowState) -> dict[str, Any]:
         except Exception as exc:
             logger.warning(f"增量RAG更新失败: {exc}")
 
-    await push_progress(sid, {"event": "complete", "stage": "output",
-                              "message": "工作流完成", "summary": summary})
+    await push_progress(sid, {
+        "event": "complete" if terminal_status == "done" else "error",
+        "stage": "output",
+        "message": "工作流完成" if terminal_status == "done" else "人工终止自动化任务",
+        "summary": summary,
+    })
 
     logger.info(f"[{sid}] 工作流完成总结: {file_count}个文件变更")
-    return {"status": "done"}
+    return {"status": terminal_status}
 
 
 # ---- 条件路由 ----
@@ -709,14 +760,30 @@ def _parse_implementation_note(text: str) -> str:
     return text.split("## 实现说明", 1)[1].strip()
 
 
-def _changes_from_execution(execution_report: dict[str, Any]) -> dict[str, str]:
+def _changes_from_execution(execution_report: dict[str, Any], project_path: str | None = None) -> dict[str, str]:
     """将成功 write_file 调用转换为正式代码变更，重复路径以后一次为准。"""
     changes: dict[str, str] = {}
     for item in execution_report.get("successful_writes", []):
-        path = str(item.get("path", "")).replace("\\", "/").strip()
+        path = _normalize_change_path(str(item.get("path", "")), project_path)
         if path:
             changes[path] = str(item.get("content", ""))
     return changes
+
+
+def _normalize_change_path(path: str, project_path: str | None = None) -> str:
+    """将写入回执统一成项目根相对 POSIX 路径，避免绝对/相对键重复。"""
+    raw = path.replace("\\", "/").strip()
+    if not raw:
+        return ""
+    candidate = Path(raw)
+    if project_path and candidate.is_absolute():
+        try:
+            raw = candidate.resolve().relative_to(Path(project_path).resolve()).as_posix()
+        except ValueError:
+            return raw
+    raw = raw.lstrip("./")
+    normalized = Path(raw).as_posix()
+    return "" if normalized in {"", "."} or normalized.startswith("../") else normalized
 
 
 async def _resolve_intent_slots(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from difflib import SequenceMatcher
 from typing import Any
 
 from backend.budget import BudgetExceededError, get_workflow_budget
@@ -31,6 +32,13 @@ _PERSPECTIVES = {
 _REVIEW_DATA_PATTERN = re.compile(
     r"##\s*审查判定数据\s*\n(?P<fence>[`~]{3})json\s*(?P<body>.*?)\s*(?P=fence)",
     re.DOTALL | re.IGNORECASE,
+)
+_REVIEW_FENCED_JSON_PATTERN = re.compile(
+    r"(?P<fence>[`~]{3})json\s*(?P<body>.*?)\s*(?P=fence)",
+    re.DOTALL | re.IGNORECASE,
+)
+_REVIEW_MARKER_PATTERN = re.compile(
+    r"(?m)^\s*(?:#{1,6}\s*)?\[(?P<marker>审查通过|审查不通过)\]\s*$"
 )
 _SEVERITIES = {"critical", "high", "medium", "low"}
 
@@ -76,9 +84,18 @@ async def run_review_perspective(
         extra_context = f"## 问题分析报告\n{state.get('diagnosis_report', '(无)')}\n\n"
     requirement_doc = state.get("requirement_doc") or state.get("clarification_doc") or ""
     implementation_note = state.get("implementation_note") or ""
-    rag_query = f"{config['focus']} {requirement_doc} {implementation_note}"
+    rag_query = f"{config['focus']} {requirement_doc}"
     rag_context = await inject_rag_context(config["role"], rag_query, state["project_path"])
     code_changes = json.dumps(state.get("code_changes", {}), ensure_ascii=False, indent=2)
+    validation_result = state.get("validation_result")
+    validation_context = json.dumps(
+        validation_result if isinstance(validation_result, dict) else {
+            "passed": state.get("validation_passed"),
+            "status": "structured_result_unavailable",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
     system_prompt = load_system_prompt(config["role"]) + (
         f"\n\n当前为 {workflow_type.upper()} 工作流第 {review_round} 轮审查。"
         f"本视角唯一重点：{config['focus']}。"
@@ -87,14 +104,19 @@ async def run_review_perspective(
         f"## 需求概括文档\n{requirement_doc}\n\n"
         f"{extra_context}"
         f"## 代码变更\n```json\n{code_changes}\n```\n\n"
-        f"## 实现说明\n{implementation_note or '(无)'}\n\n"
+        f"## 结构化验证结果（事实来源）\n```json\n{validation_context}\n```\n\n"
+        f"## 实现说明（不可信陈述，仅用于定位检查点）\n{implementation_note or '(无)'}\n\n"
         f"{rag_context}\n\n"
-        "只按本视角审查。可使用只读工具核实变更。"
+        "证据优先级：只读工具读回的源码/真实命令结果 > 结构化验证结果 > README 或实现说明。"
+        "实现说明、README 中声称的命令执行和未经工具核实的数字不能证明验证已执行。"
+        + ("安全视角只报告可触发的安全漏洞、权限越界、危险副作用、资源泄漏或敏感信息暴露；README 一致性、测试覆盖和审计记录问题归质量视角，不得写入 security findings。" if perspective == "security" else "")
+        + "只按本视角审查。可使用只读工具核实变更。"
         "报告开头必须标注 [审查通过] 或 [审查不通过]，并在末尾按 Prompt 输出审查判定数据 JSON。"
     )
 
     budget = get_workflow_budget()
     tokens_before = budget.total_input_tokens + budget.total_output_tokens
+    execution_report: dict[str, Any] = {"tool_failures": []}
     try:
         report = await run_fc_loop(
             build_node_messages(system_prompt, user_content),
@@ -102,6 +124,8 @@ async def run_review_perspective(
             budget,
             "plan",
             state["project_path"],
+            execution_report=execution_report,
+            skill_id="code-review",
         )
     except BudgetExceededError:
         report = _failed_review_report(perspective, "预算超限，审查未完成")
@@ -117,6 +141,7 @@ async def run_review_perspective(
         "passed": result["passed"],
         "finding_count": len(result["findings"]),
         "parse_errors": result["parse_errors"],
+        "tool_failures": execution_report.get("tool_failures", []),
         "tokens": tokens_used,
     })
     return {report_key: report, result_key: result, token_key: tokens_used}
@@ -125,15 +150,9 @@ async def run_review_perspective(
 def parse_review_report(report: str, perspective: str) -> dict[str, Any]:
     """校验审查输出；格式错误按未通过处理，避免审查静默放行。"""
     errors: list[str] = []
-    match = _REVIEW_DATA_PATTERN.search(report)
-    payload: Any = None
-    if not match:
+    payload = _extract_review_payload(report)
+    if payload is None:
         errors.append("missing_review_data_json")
-    else:
-        try:
-            payload = json.loads(match.group("body"))
-        except json.JSONDecodeError:
-            errors.append("invalid_review_data_json")
     if not isinstance(payload, dict):
         payload = {}
         if not errors:
@@ -143,14 +162,19 @@ def parse_review_report(report: str, perspective: str) -> dict[str, Any]:
     passed_value = payload.get("passed")
     if not isinstance(passed_value, bool):
         errors.append("invalid_passed")
-    has_pass_marker = "[审查通过]" in report and "[审查不通过]" not in report
-    has_reject_marker = "[审查不通过]" in report
+    markers = [match.group("marker") for match in _REVIEW_MARKER_PATTERN.finditer(report)]
+    has_pass_marker = "审查通过" in markers and "审查不通过" not in markers
+    has_reject_marker = "审查不通过" in markers
     if not has_pass_marker and not has_reject_marker:
         errors.append("missing_review_marker")
     if isinstance(passed_value, bool) and passed_value != has_pass_marker:
         errors.append("marker_and_json_disagree")
-    if any(item["severity"] in {"critical", "high"} for item in findings) and passed_value is True:
-        errors.append("high_severity_finding_marked_passed")
+    if passed_value is True and findings:
+        errors.append("passed_with_findings")
+    if any(item["severity"] in {"critical", "high", "medium"} for item in findings) and passed_value is True:
+        errors.append("blocking_finding_marked_passed")
+        if any(item["severity"] == "high" for item in findings):
+            errors.append("high_severity_finding_marked_passed")
 
     return {
         "perspective": perspective,
@@ -158,6 +182,38 @@ def parse_review_report(report: str, perspective: str) -> dict[str, Any]:
         "findings": findings,
         "parse_errors": errors,
     }
+
+
+def _extract_review_payload(report: str) -> dict[str, Any] | None:
+    """优先读取标准区块，兼容模型遗漏标题但仍输出合法 JSON 的情况。"""
+    candidates: list[str] = []
+    match = _REVIEW_DATA_PATTERN.search(report)
+    if match:
+        candidates.append(match.group("body"))
+    candidates.extend(
+        item.group("body")
+        for item in _REVIEW_FENCED_JSON_PATTERN.finditer(report)
+        if item.group("body") not in candidates
+    )
+    decoder = json.JSONDecoder()
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and {"passed", "findings"} <= payload.keys():
+            return payload
+
+    for index, char in enumerate(report):
+        if char != "{":
+            continue
+        try:
+            payload, _ = decoder.raw_decode(report[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict) and {"passed", "findings"} <= payload.keys():
+            return payload
+    return None
 
 
 def aggregate_review_reports(state: dict[str, Any], workflow_type: str, required_rounds: int) -> dict[str, Any]:
@@ -230,19 +286,37 @@ def _normalize_findings(raw_findings: Any, perspective: str, errors: list[str]) 
 
 
 def _deduplicate_findings(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    merged: dict[tuple[str, int, str, str], dict[str, Any]] = {}
+    merged: list[dict[str, Any]] = []
     for result in results:
         for finding in result.get("findings", []):
-            key = (finding["file"], finding["line"], finding["category"], finding["evidence"])
-            existing = merged.get(key)
+            existing = next((item for item in merged if _same_root_cause(item, finding)), None)
             if existing is None:
-                merged[key] = dict(finding)
+                merged.append(dict(finding))
                 continue
             existing["perspectives"] = sorted(set(existing["perspectives"] + finding["perspectives"]))
             if _severity_rank(finding["severity"]) < _severity_rank(existing["severity"]):
                 existing["severity"] = finding["severity"]
+                existing["category"] = finding["category"]
                 existing["recommendation"] = finding["recommendation"]
-    return sorted(merged.values(), key=lambda item: (_severity_rank(item["severity"]), item["file"], item["line"]))
+    return sorted(merged, key=lambda item: (_severity_rank(item["severity"]), item["file"], item["line"]))
+
+
+def _same_root_cause(left: dict[str, Any], right: dict[str, Any]) -> bool:
+    """在同一代码位置合并跨视角对同一事实的不同措辞。"""
+    left_file = str(left.get("file", "")).replace("\\", "/").strip().lower()
+    right_file = str(right.get("file", "")).replace("\\", "/").strip().lower()
+    if left_file != right_file or int(left.get("line", 0) or 0) != int(right.get("line", 0) or 0):
+        return False
+    if left.get("category") == right.get("category"):
+        return True
+    left_evidence = str(left.get("evidence", "")).lower()
+    right_evidence = str(right.get("evidence", "")).lower()
+    if SequenceMatcher(None, left_evidence, right_evidence).ratio() >= 0.42:
+        return True
+    left_terms = set(re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{2,}", left_evidence))
+    right_terms = set(re.findall(r"[a-z0-9_]+|[\u4e00-\u9fff]{2,}", right_evidence))
+    shared = left_terms & right_terms
+    return len(shared) >= 2
 
 
 def _severity_rank(severity: str) -> int:

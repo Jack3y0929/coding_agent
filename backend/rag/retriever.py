@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-import hashlib
 from typing import Any
 
 import numpy as np
@@ -17,6 +16,20 @@ logger = logging.getLogger("rag.retriever")
 
 def cosine_similarity(vec_a: np.ndarray, vec_b: np.ndarray) -> float:
     """计算两个向量的余弦相似度"""
+    if vec_a.ndim != 1 or vec_b.ndim != 1:
+        logger.warning(
+            "跳过非一维 RAG 向量: left_shape=%s right_shape=%s",
+            vec_a.shape,
+            vec_b.shape,
+        )
+        return 0.0
+    if vec_a.shape != vec_b.shape:
+        logger.warning(
+            "跳过维度不匹配的 RAG 向量: left_dim=%s right_dim=%s",
+            vec_a.size,
+            vec_b.size,
+        )
+        return 0.0
     dot_product = np.dot(vec_a, vec_b)
     norm_a = np.linalg.norm(vec_a)
     norm_b = np.linalg.norm(vec_b)
@@ -70,8 +83,6 @@ async def hybrid_retrieve(
     source_type: str | None = None,
     project_path: str | None = None,
     db_path: str | None = None,
-    scope_types: list[str] | None = None,
-    scope_key: str = "",
 ) -> list[dict[str, Any]]:
     """
     混合检索：关键词搜索 + 语义搜索 → RRF融合 → 返回top_k条
@@ -88,17 +99,13 @@ async def hybrid_retrieve(
         except ValueError:
             return []
 
-    keyword_results = await _keyword_search(query, source_type=source_type, top_k=top_k * 2,
-                                            project_path=project_path, db_path=db_path,
-                                            scope_types=scope_types, scope_key=scope_key)
+    keyword_results = await _keyword_search(query, source_type=source_type, top_k=top_k * 2, project_path=project_path, db_path=db_path)
 
     query_vec = engine.encode(query)
-    semantic_results = await _semantic_search(query_vec, source_type=source_type, top_k=top_k * 2,
-                                              project_path=project_path, db_path=db_path,
-                                              scope_types=scope_types, scope_key=scope_key)
+    semantic_results = await _semantic_search(query_vec, source_type=source_type, top_k=top_k * 2, project_path=project_path, db_path=db_path)
 
     fused = rrf_fusion(keyword_results, semantic_results)
-    results = fused[:top_k]
+    results = _dedupe_results(fused)[:top_k]
     if not results:
         try:
             from backend.trace import record_event
@@ -114,7 +121,6 @@ async def hybrid_retrieve_for_role(
     top_k: int = 5,
     project_path: str | None = None,
     db_path: str | None = None,
-    team_id: str = "",
 ) -> str:
     """
     根据角色进行混合检索，返回格式化的上下文字符串。
@@ -125,32 +131,24 @@ async def hybrid_retrieve_for_role(
     - debugger: 源码 top 8 + 历史错误 top 3
     """
     if role == "analyst":
-        results = await hybrid_retrieve(query, top_k=3, source_type="spec", project_path=project_path, db_path=db_path,
-                                        scope_types=["global", "team"], scope_key=team_id)
-        results += await hybrid_retrieve(query, top_k=5, source_type="memory", project_path=project_path, db_path=db_path,
-                                         scope_types=["global", "team", "project"], scope_key=team_id)
+        results = await hybrid_retrieve(query, top_k=3, source_type="memory", project_path=project_path, db_path=db_path)
     elif role in ("developer", "fix"):
-        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path,
-                                              scope_types=["project"], scope_key=team_id)
-        mem_results = await hybrid_retrieve(query, top_k=2, source_type="memory", project_path=project_path, db_path=db_path,
-                                            scope_types=["global", "team", "project"], scope_key=team_id)
-        results = code_results + mem_results
+        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path)
+        mem_results = await hybrid_retrieve(query, top_k=2, source_type="memory", project_path=project_path, db_path=db_path)
+        results = _dedupe_results(code_results + mem_results)
     elif role in ("reviewer", "review_logic", "review_security", "review_quality"):
-        results = await hybrid_retrieve(query, top_k=5, source_type="spec", project_path=project_path, db_path=db_path,
-                                        scope_types=["global", "team"], scope_key=team_id)
+        results = await hybrid_retrieve(query, top_k=5, source_type="spec", project_path=project_path, db_path=db_path)
         # 同时检索错误模式库
-        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path,
-                                               scope_types=["global", "team", "project"], scope_key=team_id)
-        results = rrf_fusion(results, error_results)[:top_k]
+        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path)
+        results = _dedupe_results(rrf_fusion(results, error_results))[:top_k]
     elif role == "debugger":
-        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path,
-                                              scope_types=["project"], scope_key=team_id)
-        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path,
-                                               scope_types=["global", "team", "project"], scope_key=team_id)
-        results = rrf_fusion(code_results, error_results)[:top_k]
+        code_results = await hybrid_retrieve(query, top_k=8, source_type="file", project_path=project_path, db_path=db_path)
+        error_results = await hybrid_retrieve(query, top_k=3, source_type="error", project_path=project_path, db_path=db_path)
+        results = _dedupe_results(rrf_fusion(code_results, error_results))[:top_k]
     else:
         results = await hybrid_retrieve(query, top_k=top_k, project_path=project_path, db_path=db_path)
 
+    results = _dedupe_results(results)[:top_k]
     await _trace_retrieval(role, query, results, project_path)
     return _format_rag_context(results)
 
@@ -200,24 +198,34 @@ def _format_rag_context(results: list[dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _dedupe_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """按内容哈希去重，兼容旧索引中没有哈希的记录。"""
+    seen: set[str] = set()
+    unique: list[dict[str, Any]] = []
+    for item in results:
+        key = item.get("content_hash") or f"id:{item.get('id')}"
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(item)
+    return unique
+
+
 # ---- 内部检索函数 ----
 
 async def _keyword_search(query: str, source_type: str | None = None,
                           top_k: int = 20, project_path: str | None = None,
-                          db_path: str | None = None,
-                          scope_types: list[str] | None = None,
-                          scope_key: str = "") -> list[dict]:
+                          db_path: str | None = None) -> list[dict]:
     """关键词检索：SQL LIKE模糊匹配"""
     async with (Database(db_path) if db_path else Database()) as db:
-        results = await db.keyword_search_rag(query, source_type=source_type, limit=top_k,
-                                              project_path=project_path, scope_types=scope_types,
-                                              scope_key=scope_key)
+        results = await db.keyword_search_rag(query, source_type=source_type, limit=top_k, project_path=project_path)
     return [{
         "id": r["id"],
         "content": r["content"],
         "source_type": r["source_type"],
         "source_path": r["source_path"],
         "project_path": r.get("project_path", ""), "file_hash": r.get("file_hash"),
+        "content_hash": r.get("content_hash"),
         "symbol": r.get("symbol"),
         "chunk_index": r.get("chunk_index", 0),
     } for r in results]
@@ -225,13 +233,10 @@ async def _keyword_search(query: str, source_type: str | None = None,
 
 async def _semantic_search(query_vec: np.ndarray, source_type: str | None = None,
                            top_k: int = 20, project_path: str | None = None,
-                           db_path: str | None = None,
-                           scope_types: list[str] | None = None,
-                           scope_key: str = "") -> list[dict]:
+                           db_path: str | None = None) -> list[dict]:
     """语义检索：加载所有向量，计算余弦相似度，取top_k"""
     async with (Database(db_path) if db_path else Database()) as db:
-        all_embeddings = await db.get_all_rag_embeddings(source_type=source_type, project_path=project_path,
-                                                         scope_types=scope_types, scope_key=scope_key)
+        all_embeddings = await db.get_all_rag_embeddings(source_type=source_type, project_path=project_path)
 
     if source_type:
         all_embeddings = [e for e in all_embeddings if e.get("source_type") == source_type]
@@ -249,8 +254,12 @@ async def _semantic_search(query_vec: np.ndarray, source_type: str | None = None
             continue
         stored_vec = np.frombuffer(emb_data, dtype=np.float32)
         if stored_vec.shape != query_vec.shape:
-            logger.debug("跳过维度不匹配的 RAG 向量: id=%s dim=%s query_dim=%s",
-                         item.get("id"), stored_vec.size, query_vec.size)
+            logger.warning(
+                "跳过 embedding 维度不匹配的 RAG 记录: id=%s query_dim=%s stored_dim=%s",
+                item.get("id"),
+                query_vec.size,
+                stored_vec.size,
+            )
             continue
         sim = cosine_similarity(query_vec, stored_vec)
         scored.append({
@@ -259,6 +268,7 @@ async def _semantic_search(query_vec: np.ndarray, source_type: str | None = None
             "source_type": item["source_type"],
             "source_path": item["source_path"],
             "project_path": item.get("project_path", ""), "file_hash": item.get("file_hash"),
+            "content_hash": item.get("content_hash"),
             "symbol": item.get("symbol"),
             "chunk_index": item.get("chunk_index", 0),
             "score": sim,
@@ -302,15 +312,9 @@ async def init_spec_library() -> None:
     engine = get_embedding_engine()
     async with Database() as db:
         for source_type, title, content in RULE_ENTRIES:
-            existing = await db.get_rag_by_source(f"spec://{title}")
-            if existing and all(
-                item.get("embedding_model") == engine.model_name
-                and item.get("embedding_model_version") == engine.model_version
-                for item in existing
-            ):
-                continue  # 当前模型版本已存在则跳过
+            existing = await db.keyword_search_rag(title, source_type="spec", limit=1)
             if existing:
-                await db.delete_rag_by_source(f"spec://{title}")
+                continue  # 已存在则跳过
 
             emb_bytes = engine.encode_to_bytes(content)
             await db.insert_rag_embedding(
@@ -320,10 +324,5 @@ async def init_spec_library() -> None:
                 content=f"【{title}】{content}",
                 embedding=emb_bytes,
                 token_count=len(content),
-                scope_type="global",
-                content_hash=hashlib.sha256(content.encode("utf-8")).hexdigest(),
-                embedding_model=engine.model_name,
-                embedding_model_version=engine.model_version,
-                embedding_dimension=engine.dimension,
             )
     logger.info("规范库初始化完成")
