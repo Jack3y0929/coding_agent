@@ -4,6 +4,8 @@ __pycache__/
 node_modules/
 dist/
 .workflow_tasks/
+.swebench/
+.featurebench/
 logs-*.out
 logs-*.err
 .idea/

@@ -27,6 +27,34 @@ MAX_RETRIES: int = int(os.getenv("MAX_RETRIES", "2"))
 PROJECT_ROOT: str = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DB_PATH: str = os.path.join(PROJECT_ROOT, "just_codding.db")
 
+# SWE-bench 评测配置。官方 Harness 在独立 Docker 环境中执行，不复用产品 Shell 白名单。
+SWEBENCH_DATASET_NAME: str = os.getenv(
+    "SWEBENCH_DATASET_NAME", "princeton-nlp/SWE-bench_Verified"
+)
+SWEBENCH_SPLIT: str = os.getenv("SWEBENCH_SPLIT", "test")
+SWEBENCH_WORK_ROOT: str = os.path.abspath(os.getenv(
+    "SWEBENCH_WORK_ROOT", os.path.join(PROJECT_ROOT, ".swebench")
+))
+SWEBENCH_MAX_WORKERS: int = int(os.getenv("SWEBENCH_MAX_WORKERS", "1"))
+SWEBENCH_TRIAL_TIMEOUT: int = int(os.getenv("SWEBENCH_TRIAL_TIMEOUT", "1800"))
+SWEBENCH_DOCKER_REQUIRED: bool = (
+    os.getenv("SWEBENCH_DOCKER_REQUIRED", "true").lower() == "true"
+)
+SWEBENCH_MAX_FIX_ATTEMPTS: int = int(os.getenv("SWEBENCH_MAX_FIX_ATTEMPTS", "3"))
+
+# FeatureBench 评测配置。Agent 的文件操作在官方任务容器 /testbed 中完成。
+FEATUREBENCH_DATASET: str = os.getenv("FEATUREBENCH_DATASET", "LiberCoders/FeatureBench")
+FEATUREBENCH_DATA_VERSION: str = os.getenv("FEATUREBENCH_DATA_VERSION", "v1.1")
+FEATUREBENCH_SPLIT: str = os.getenv("FEATUREBENCH_SPLIT", "fast")
+FEATUREBENCH_WORK_ROOT: str = os.path.abspath(os.getenv(
+    "FEATUREBENCH_WORK_ROOT", os.path.join(PROJECT_ROOT, ".featurebench")
+))
+FEATUREBENCH_MAX_WORKERS: int = int(os.getenv("FEATUREBENCH_MAX_WORKERS", "1"))
+FEATUREBENCH_TASK_TIMEOUT: int = int(os.getenv("FEATUREBENCH_TASK_TIMEOUT", "3600"))
+FEATUREBENCH_MAX_FIX_ATTEMPTS: int = int(os.getenv("FEATUREBENCH_MAX_FIX_ATTEMPTS", "3"))
+FEATUREBENCH_CONTAINER_CPUS: float = float(os.getenv("FEATUREBENCH_CONTAINER_CPUS", "2"))
+FEATUREBENCH_CONTAINER_MEMORY: str = os.getenv("FEATUREBENCH_CONTAINER_MEMORY", "8g")
+
 # Shell 命令白名单
 # 版本查询属于无副作用的读取操作，应允许 Agent 用于确认运行环境。
 SHELL_WHITELIST: List[str] = [
